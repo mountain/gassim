@@ -182,6 +182,19 @@ impl GasSim {
             .map_err(py_err)
     }
 
+    /// Phase 2: Configure a thermal wall with bath temperature T and accommodation α (default 1.0).
+    ///
+    /// Parameters
+    /// - wall_id: integer in [0, 5] indexing the 6 axis-aligned walls
+    /// - T: bath temperature (must be > 0)
+    /// - accommodation: Maxwell accommodation coefficient α ∈ [0,1] (default 1.0)
+    #[pyo3(signature = (wall_id, t, accommodation=1.0))]
+    fn set_thermal_wall(&mut self, wall_id: u32, t: f64, accommodation: f64) -> PyResult<()> {
+        self.sim
+            .set_thermal_wall(wall_id, t, accommodation)
+            .map_err(py_err)
+    }
+
     /// Phase 1: Return the cumulative mechanical work done on the gas by moving walls.
     fn get_work_done(&self) -> PyResult<f64> {
         Ok(self.sim.work_total())
@@ -233,6 +246,54 @@ impl GasSim {
     /// Phase 1.5: Return total mechanical work and total heat (Phase 2 will populate heat).
     fn get_work_heat(&self) -> PyResult<(f64, f64)> {
         Ok(self.sim.work_heat())
+    }
+
+    /// Phase 2: Return the total accumulated heat Q transferred from thermal boundaries to the gas.
+    fn get_heat_flow(&self) -> PyResult<f64> {
+        Ok(self.sim.heat_total())
+    }
+
+    /// Phase 2: Return a (M, 3) NumPy array of [time, dQ, wall_id] heat events.
+    ///
+    /// Parameters
+    /// - window: if provided, only events with time >= (current_time - window) are returned.
+    /// - wall_id: if provided, filter events for this wall only.
+    #[pyo3(signature = (window=None, wall_id=None))]
+    fn get_heat_history<'py>(
+        &self,
+        py: Python<'py>,
+        window: Option<f64>,
+        wall_id: Option<u32>,
+    ) -> PyResult<Py<PyArray2<f64>>> {
+        let events = self.sim.heat_events();
+        let now = self.sim.time();
+        if let Some(w) = window {
+            if !w.is_finite() || w < 0.0 {
+                return Err(py_err("window must be a non-negative finite float"));
+            }
+        }
+        let filtered: Vec<(f64, f64, u32)> = events
+            .into_iter()
+            .filter(|(t, _dq, wid)| {
+                let pass_time = match window {
+                    Some(w) => *t >= now - w,
+                    None => true,
+                };
+                let pass_wall = match wall_id {
+                    Some(wid_req) => *wid == wid_req,
+                    None => true,
+                };
+                pass_time && pass_wall
+            })
+            .collect();
+        let m = filtered.len();
+        let mut arr = Array2::<f64>::zeros((m, 3));
+        for (i, (t, dq, wid)) in filtered.into_iter().enumerate() {
+            arr[[i, 0]] = t;
+            arr[[i, 1]] = dq;
+            arr[[i, 2]] = wid as f64;
+        }
+        Ok(arr.into_pyarray(py).to_owned().into())
     }
 
     /// Phase 1.5: Temperature tensor diagnostics with optional boolean mask.

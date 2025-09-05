@@ -7,6 +7,7 @@ use std::collections::BinaryHeap;
 
 /// Small numeric tolerance for time and geometric checks.
 const EPS_TIME: f64 = 1e-12;
+const N_WALLS: usize = DIM * 2;
 
 /// Kinematics for an axis-aligned planar wall with piecewise-constant velocity.
 /// Position evolves as: pos(t) = base_pos + u * (t - base_time)
@@ -49,6 +50,15 @@ pub struct Simulation {
     // Phase 1.5: simple histories for windowed diagnostics
     energy_history: Vec<(f64, f64)>, // (time, kinetic_energy)
     work_history: Vec<(f64, f64)>,   // (time, work_total snapshot)
+
+    // Phase 2: thermal walls and heat accounting
+    // thermal_walls[wall_id] = Some((T_bath, accommodation)) or None if adiabatic/specular
+    thermal_walls: [Option<(f64, f64)>; N_WALLS],
+    // Dedicated RNG stream per wall for reproducibility of thermal sampling
+    rng_walls: Vec<StdRng>,
+    // Heat accounting
+    heat_total: f64,
+    heat_events: Vec<(f64, f64, u32)>, // (time, dQ, wall_id)
 }
 
 impl Simulation {
@@ -139,6 +149,13 @@ impl Simulation {
             wall_max[k].base_pos = box_size[k];
         }
 
+        // Phase 2: set up per-wall RNG streams for thermal sampling
+        let mut rng_walls: Vec<StdRng> = Vec::with_capacity(N_WALLS);
+        for _w in 0..N_WALLS {
+            let s: u64 = rng.random();
+            rng_walls.push(SeedableRng::seed_from_u64(s));
+        }
+
         let mut sim = Self {
             time_now: 0.0,
             box_size,
@@ -151,6 +168,12 @@ impl Simulation {
             piston_wall_id: None,
             energy_history: Vec::new(),
             work_history: Vec::new(),
+
+            // Phase 2 init
+            thermal_walls: [None; N_WALLS],
+            rng_walls,
+            heat_total: 0.0,
+            heat_events: Vec::new(),
         };
         // Initial snapshots at t=0
         let u0 = sim.kinetic_energy();
@@ -220,6 +243,44 @@ impl Simulation {
         self.pressure_events.clone()
     }
 
+    /// Phase 2: Configure a thermal wall with bath temperature T and accommodation α ∈ [0,1].
+    /// - wall_id in [0, 2*DIM-1]
+    /// - T must be > 0 and finite
+    /// - accommodation α in [0,1]
+    pub fn set_thermal_wall(
+        &mut self,
+        wall_id: u32,
+        t_bath: f64,
+        accommodation: f64,
+    ) -> Result<()> {
+        let idx = wall_id as usize;
+        if idx >= N_WALLS {
+            return Err(crate::error::Error::InvalidParam("invalid wall_id".into()));
+        }
+        if !t_bath.is_finite() || t_bath <= 0.0 {
+            return Err(crate::error::Error::InvalidParam(
+                "thermal wall T must be finite and > 0".into(),
+            ));
+        }
+        if !accommodation.is_finite() || !(0.0..=1.0).contains(&accommodation) {
+            return Err(crate::error::Error::InvalidParam(
+                "accommodation must be in [0,1]".into(),
+            ));
+        }
+        self.thermal_walls[idx] = Some((t_bath, accommodation));
+        Ok(())
+    }
+
+    /// Phase 2: Return total accumulated heat Q (sum of ΔQ over thermal interactions).
+    pub fn heat_total(&self) -> f64 {
+        self.heat_total
+    }
+
+    /// Phase 2: Return a copy of heat events as (time, dQ, wall_id).
+    pub fn heat_events(&self) -> Vec<(f64, f64, u32)> {
+        self.heat_events.clone()
+    }
+
     /// Phase 1.5: Windowed mechanical pressure estimate on a wall using impulse history.
     ///
     /// Computes P ≈ (Σ |Δp|) / (A * Δt) over events within [time_now - window, time_now],
@@ -260,9 +321,9 @@ impl Simulation {
         Ok(sum_impulse / (area * window))
     }
 
-    /// Phase 1.5: Return total mechanical work and total heat (Phase 2: heat, currently 0.0).
+    /// Phase 1.5/2: Return total mechanical work and total heat.
     pub fn work_heat(&self) -> (f64, f64) {
-        (self.work_total, 0.0)
+        (self.work_total, self.heat_total)
     }
 
     /// Phase 1.5: Compute drift-removed temperature tensor diagonals and scalar T from current velocities.
@@ -1003,10 +1064,11 @@ impl Simulation {
         Ok(())
     }
 
-    /// Resolve a particle-wall collision with a possibly moving wall (piston).
+    /// Resolve a particle-wall collision with a possibly moving and possibly thermal wall.
     ///
-    /// Reflection is done in the wall frame and transformed back:
-    /// v_x' = 2 u_w - v_x (normal component only). Tangential components unchanged (plane is axis-aligned).
+    /// - If wall is adiabatic/specular: reflect the normal component in the moving-wall frame.
+    /// - If wall is thermal: with probability α, resample outgoing velocity from a half-space Maxwellian
+    ///   at temperature T in the wall frame; otherwise specular reflect. Accumulate heat ΔQ.
     fn resolve_p2w(&mut self, i: usize, wall_id: u32) -> Result<()> {
         let (axis, is_max) = wall_axis_side(wall_id);
 
@@ -1023,12 +1085,72 @@ impl Simulation {
             )
         };
 
-        // Pre-collision normal component
-        let v_before = self.particles[i].v[axis];
+        // Copy pre-collision velocity for ΔQ accounting
+        let v_before_vec = self.particles[i].v;
+        let v_before_n = v_before_vec[axis];
 
-        // Moving mirror reflection along normal
-        let v_after = 2.0 * u_w - v_before;
-        self.particles[i].v[axis] = v_after;
+        let mut used_specular = false;
+
+        if let Some((t_bath, accommodation)) = self.thermal_walls[wall_id as usize] {
+            // Decide thermal resampling vs specular reflection
+            let u: f64 = self.rng_walls[wall_id as usize].random_range(0.0..1.0);
+            if u < accommodation {
+                // Thermal resampling in wall frame
+                let m = self.particles[i].mass;
+                let sigma2 = t_bath / m;
+                if !sigma2.is_finite() || sigma2 <= 0.0 {
+                    return Err(Error::InvalidParam(
+                        "thermal wall requires positive finite T and mass".into(),
+                    ));
+                }
+                let sigma = sigma2.sqrt();
+
+                // Sample tangential components: Normal(0, σ²) via Box–Muller (two independent)
+                let (z0, z1) = sample_standard_normal_pair(&mut self.rng_walls[wall_id as usize]);
+                // Sample normal magnitude (into gas): Rayleigh(σ); sign depends on wall side
+                let r_ray = sample_rayleigh(&mut self.rng_walls[wall_id as usize], sigma);
+                let sign_n = if is_max { -1.0 } else { 1.0 }; // into domain
+                let c_n_plus = sign_n * r_ray;
+
+                // Build outgoing velocity in lab frame
+                let mut v_after_vec = [0.0_f64; DIM];
+                // Normal component with wall velocity offset
+                v_after_vec[axis] = c_n_plus + u_w;
+                // Tangential axes mapping (the two axes != axis)
+                let mut t_idx = 0usize;
+                for (k, vk) in v_after_vec.iter_mut().enumerate() {
+                    if k == axis {
+                        continue;
+                    }
+                    let z = if t_idx == 0 { z0 } else { z1 };
+                    *vk = sigma * z; // wall tangential velocity is zero
+                    t_idx += 1;
+                }
+
+                // Assign velocity
+                self.particles[i].v = v_after_vec;
+
+                // Heat increment ΔQ = ½ m (|v⁺|² − |v⁻|²)
+                let vsq_before: f64 = v_before_vec.iter().map(|&c| c * c).sum();
+                let vsq_after: f64 = v_after_vec.iter().map(|&c| c * c).sum();
+                let d_q = 0.5 * m * (vsq_after - vsq_before);
+                self.heat_total += d_q;
+                self.heat_events.push((self.time_now, d_q, wall_id));
+            } else {
+                // Specular branch (moving mirror)
+                used_specular = true;
+            }
+        } else {
+            // Not a thermal wall
+            used_specular = true;
+        }
+
+        if used_specular {
+            // Moving mirror reflection along normal
+            let v_after = 2.0 * u_w - v_before_n;
+            self.particles[i].v[axis] = v_after;
+            // Tangential components unchanged
+        }
 
         // Snap position to the exact contact plane accounting for radius
         if is_max {
@@ -1037,17 +1159,17 @@ impl Simulation {
             self.particles[i].r[axis] = pos_now + self.particles[i].radius;
         }
 
-        // Measurements for Phase 1
-        // Momentum impulse on particle along normal
+        // Measurements: impulse and mechanical work (applies to piston and thermal)
         let m = self.particles[i].mass;
-        let delta_p = m * (v_after - v_before); // signed impulse on particle
+        let v_after_n = self.particles[i].v[axis];
+        let delta_p = m * (v_after_n - v_before_n); // signed impulse on particle along normal
+
         if let Some(piston_id) = self.piston_wall_id {
             if piston_id == wall_id {
-                // Accumulate absolute impulse for pressure proxy
                 self.pressure_events.push((self.time_now, delta_p.abs()));
             }
         }
-        // Mechanical work done on gas by the moving wall: W += u_w * Δp (wall velocity dot impulse)
+        // Mechanical work done on gas by the moving wall: W += u_w * Δp
         self.work_total += u_w * delta_p;
 
         Ok(())
@@ -1084,6 +1206,27 @@ fn overlaps_existing(existing: &[Particle], r: &[f64; DIM], radius: f64) -> bool
         }
     }
     false
+}
+
+fn sample_standard_normal_pair<R: Rng + ?Sized>(rng: &mut R) -> (f64, f64) {
+    // Box–Muller transform
+    let mut u1: f64 = rng.random_range(0.0..1.0);
+    // Guard against log(0)
+    if u1 < 1e-16 {
+        u1 = 1e-16;
+    }
+    let u2: f64 = rng.random_range(0.0..1.0);
+    let r = (-2.0 * u1.ln()).sqrt();
+    let theta = 2.0 * std::f64::consts::PI * u2;
+    (r * theta.cos(), r * theta.sin())
+}
+
+fn sample_rayleigh<R: Rng + ?Sized>(rng: &mut R, sigma: f64) -> f64 {
+    let mut u: f64 = rng.random_range(0.0..1.0);
+    if u < 1e-16 {
+        u = 1e-16;
+    }
+    sigma * (-2.0 * u.ln()).sqrt()
 }
 
 #[cfg(test)]
