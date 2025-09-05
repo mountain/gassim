@@ -208,6 +208,15 @@ impl Simulation {
         self.particles.iter().map(|p| p.kinetic_energy()).sum()
     }
 
+    /// Rebuild the event queue from the current particle states and box.
+    ///
+    /// This should be called after externally modifying positions/velocities
+    /// (e.g., via Python setters) to ensure event times are consistent.
+    pub fn rebuild_event_queue(&mut self) -> Result<()> {
+        self.pq.clear();
+        self.schedule_initial_events()
+    }
+
     // ============ Internal helpers ============
 
     fn schedule_initial_events(&mut self) -> Result<()> {
@@ -374,23 +383,20 @@ impl Simulation {
             return Ok(());
         }
         for p in &mut self.particles {
-            for (k, r_k) in p.r.iter_mut().enumerate() {
-                *r_k += p.v[k] * dt;
-                // Clamp inside domain with tolerance
+            for k in 0..DIM {
                 let lo = p.radius;
                 let hi = self.box_size[k] - p.radius;
-                if *r_k < lo - 1e-9 || *r_k > hi + 1e-9 {
-                    // Due to numerical drift, snap to bounds within tolerance
-                    if (*r_k - lo).abs() < 1e-8 {
-                        *r_k = lo;
-                    } else if (*r_k - hi).abs() < 1e-8 {
-                        *r_k = hi;
-                    } else {
-                        return Err(Error::OutOfBounds(format!(
-                            "particle {} went out of bounds on axis {}: r={}, allowed [{}, {}]",
-                            p.id, k, *r_k, lo, hi
-                        )));
-                    }
+
+                // Linear drift
+                p.r[k] += p.v[k] * dt;
+
+                // Safety clamp: if position is outside bounds, clamp to bounds.
+                // This is a fallback for numerical drift or stale events.
+                // The proper wall collision handling should be via P2W events.
+                if p.r[k] < lo {
+                    p.r[k] = lo;
+                } else if p.r[k] > hi {
+                    p.r[k] = hi;
                 }
             }
         }
@@ -439,18 +445,17 @@ impl Simulation {
 
     /// Resolve a particle-wall collision by specular reflection on the hit axis.
     fn resolve_p2w(&mut self, i: usize, wall_id: u32) -> Result<()> {
-        let (axis, _is_max) = wall_axis_side(wall_id);
+        let (axis, is_max) = wall_axis_side(wall_id);
         // Mirror reflection: flip the normal component
         self.particles[i].v[axis] = -self.particles[i].v[axis];
 
-        // Snap position to exact contact plane within tolerance
+        // Snap position to the exact contact plane
         let lo = self.particles[i].radius;
         let hi = self.box_size[axis] - self.particles[i].radius;
-        // Decide which plane we are at based on current coordinate
-        if (self.particles[i].r[axis] - lo).abs() <= 1e-7 {
-            self.particles[i].r[axis] = lo;
-        } else if (self.particles[i].r[axis] - hi).abs() <= 1e-7 {
+        if is_max {
             self.particles[i].r[axis] = hi;
+        } else {
+            self.particles[i].r[axis] = lo;
         }
         Ok(())
     }

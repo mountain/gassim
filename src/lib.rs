@@ -124,6 +124,8 @@ impl GasSim {
                 self.sim.particles[i].r[k] = val;
             }
         }
+        // Rebuild event queue to reflect updated positions
+        self.sim.rebuild_event_queue().map_err(py_err)?;
         Ok(())
     }
 
@@ -150,6 +152,8 @@ impl GasSim {
                 self.sim.particles[i].v[k] = val;
             }
         }
+        // Rebuild event queue to reflect updated velocities
+        self.sim.rebuild_event_queue().map_err(py_err)?;
         Ok(())
     }
 }
