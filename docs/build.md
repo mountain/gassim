@@ -1,92 +1,81 @@
-# Build, Test, and Package Guide
+# Build and Install (Local)
 
-This document describes how to build, lint, test, and generate docs for GasSim across environments.
+This guide shows two ways to build and install the `gassim` Python extension locally:
 
-The project is a Rust core library with a Python extension module exposed via PyO3 and built with Maturin.
+- Option A: maturin develop (requires a virtualenv or conda env)
+- Option B: Build a wheel and install it with pip (works without a venv)
+
+Either option installs the Rust extension module so Python can import `gassim`.
 
 ## Prerequisites
 
-- Rust (stable toolchain)
-- Python >= 3.13 (CPython or PyPy)
-- Maturin (for building the Python extension)
-  - Install: `pip install maturin`
+- Rust toolchain (edition 2021). Install via https://rustup.rs
+- Python >= 3.13 (CPython or PyPy recommended)
+- pip and setuptools in your target Python environment
+- maturin >= 1.9
 
-## Dependencies and Versions
-
-- PyO3: 0.26
-- numpy crate: 0.23
-
-These are aligned in `Cargo.toml` to avoid FFI link conflicts. The crate is built as an extension module targeting the stable Python ABI (abi3) for Python 3.13.
-
-## Important Environment Variables
-
-None required for this project.
-
-With PyO3 ≥ 0.26 and the `abi3-py313` feature enabled, PyO3 automatically handles newer interpreter versions (e.g., Python 3.13) without manual environment variables. When the active Python interpreter is newer than PyO3’s maximum supported version, PyO3 falls back to an abi3 build for the latest supported version.
-
-## Standard Rust Workflow
-
-This is the recommended sequence to ensure conformance with AGENT.md:
-
-- Format:
-  - `cargo fmt --all -- --check`
-- Lint (fail on warnings):
-  - `cargo clippy -- -D warnings`
-- Test:
-  - `cargo test`
-- Docs:
-  - `cargo doc --no-deps`
-
-## Python Extension Build (Maturin)
-
-- Develop (in-place build, importable from the venv):
-  - `maturin develop`
-- Build wheel:
-  - `maturin build`
-- Build and publish (example):
-  - `maturin publish`
-
-macOS note:
-- For universal2 wheels on Apple Silicon/Intel, see Maturin’s docs (e.g., `--universal2` flag).
-- Ensure you’re building inside a Python virtual environment matching your target.
-
-## Example: Local CI Script
-
-Below is a bash script you can paste into a local CI step or run manually.
-
-```bash
-#!/usr/bin/env bash
-set -euo pipefail
-
-echo "[1/4] Formatting check"
-cargo fmt --all -- --check
-
-echo "[2/4] Lint (clippy -D warnings)"
-cargo clippy -- -D warnings
-
-echo "[3/4] Tests"
-cargo test
-
-echo "[4/4] Docs"
-cargo doc --no-deps
-
-echo "Done."
+Install maturin:
+```
+python -m pip install -U maturin
 ```
 
-## Troubleshooting
+## Option A. maturin develop (requires a virtualenv/conda)
 
-- Link conflicts or version mismatches:
-  - Ensure `Cargo.toml` aligns PyO3 (`0.26`) and numpy crate (`0.23`).
-  - Confirm the crate features include `extension-module` and `abi3-py313`.
-- Importing from Python fails after `maturin develop`:
-  - Verify you’re in the same Python environment where `maturin develop` was run.
-  - On macOS, ensure correct architecture (e.g., not mixing arm64 vs x86_64).
-- Dense initial configurations:
-  - For very dense initial configurations (large N, large radius, small box), initialization can fail. Use fewer particles, a smaller radius, or a larger box.
+1) Create and activate a virtual environment:
+```
+# venv example
+python -m venv .venv
+source .venv/bin/activate
+# OR conda
+# conda create -n gassim-py313 python=3.13 -y
+# conda activate gassim-py313
+```
 
-## What We Run in CI (Equivalent)
+2) Build and install into the active environment:
+```
+maturin develop -m pyproject.toml
+```
 
-- `cargo fmt --all -- --check`
-- `cargo clippy -- -D warnings`
-- `cargo test`
-- `cargo doc --no-deps`
+3) Test import:
+```
+python -c "import gassim; from gassim import GasSim; print('GasSim ok')"
+```
+
+## Option B. Build a wheel and install it with pip (no venv required)
+
+1) From the repository root (where Cargo.toml is), build a wheel:
+```
+maturin build --release -m pyproject.toml
+```
+
+This writes a `.whl` file into `target/wheels/`.
+
+2) Install the freshly built wheel into your current Python environment:
+```
+python -m pip install --force-reinstall target/wheels/gassim-*.whl
+```
+
+3) Test import:
+```
+python -c "import gassim; from gassim import GasSim; print('GasSim ok')"
+```
+
+## Running the Example
+
+After installing the extension (Option A or B), run:
+```
+python examples/half_box_relax.py
+```
+
+This will:
+- Evolve a half-box initialization toward equilibrium
+- Save periodic x–y position snapshots to `snapshots/positions_t*.png`
+- Save the final speed-vs-Maxwell PDF plot to `snapshots/speed_distribution.png`
+
+## Notes
+
+- If you update Rust code (e.g., `src/core/sim.rs`), you need to reinstall the extension so Python loads the new binary:
+  - Option A: re-run `maturin develop -m pyproject.toml` (with the same venv activated)
+  - Option B: re-run `maturin build --release -m pyproject.toml` and `python -m pip install --force-reinstall target/wheels/gassim-*.whl`
+- Ensure you rebuild/install into the exact Python environment that you use to run the example/script.
+- If you hit `maturin develop` errors about not finding a virtualenv, use Option B to build+install a wheel, or create/activate a venv and retry.

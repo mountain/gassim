@@ -1,32 +1,25 @@
-# Publishing GasSim (macOS, universal2) — Simple Guide
+# Publishing GasSim (macOS) — Practical Guide
 
-This guide shows how to publish GasSim wheels from a macOS laptop as a single universal2 wheel (arm64 + x86_64). It aims to be minimal and reliable for early releases.
-
-If you only need to test locally, you can skip the PyPI steps and just build/install a wheel on your machine.
+This guide shows how to publish GasSim wheels from a macOS laptop. It provides a simple, tested approach that works reliably for early releases.
 
 ---
 
 ## 1) Prerequisites
 
-- macOS with Xcode Command Line Tools installed (for Clang and SDKs)
+- macOS with Xcode Command Line Tools installed
   - xcode-select --install
-- Python >= 3.13 in your publishing environment
-- Rust toolchain installed (via rustup)
+- Python >= 3.13 (use `python3` command)
+- Rust toolchain installed (via https://rustup.rs)
 - maturin >= 1.9
-  - pip install maturin
+  - python3 -m pip install -U maturin
 
-Optional (recommended):
-- Have both Rust targets installed (arm64 and x86_64), so maturin can produce a universal2 wheel:
-  - rustup target add aarch64-apple-darwin x86_64-apple-darwin
-
-Note:
-- GasSim already targets Python 3.13 via abi3, so one wheel per OS/arch covers all CPython 3.13.x patch versions.
+Note: GasSim targets Python 3.13 via abi3, so one wheel covers all CPython 3.13.x patch versions.
 
 ---
 
 ## 2) Pre-Publish Checks (Local)
 
-Run standard quality gates before cutting a release:
+Run quality gates before cutting a release:
 
 ```
 cargo fmt --all --check
@@ -35,78 +28,66 @@ cargo test
 cargo doc --no-deps
 ```
 
-If these pass, proceed.
+All must pass before proceeding.
 
 ---
 
 ## 3) Versioning
 
-- Update the version in Cargo.toml (and ensure the same version is reflected for Python via pyproject metadata if/when needed).
-- Commit changes and optionally tag:
-  - git add -A
-  - git commit -m "chore(release): v0.x.y"
-  - git tag v0.x.y
-
-(You can push the tag later if you maintain a consistent release flow.)
+Update the version in Cargo.toml, commit changes, and optionally tag:
+```
+# Edit Cargo.toml version field
+git add -A
+git commit -m "chore(release): v0.x.y"
+git tag v0.x.y
+```
 
 ---
 
-## 4) Build a universal2 wheel (Local)
+## 4) Build and Test Wheel (Local)
 
-Since your maturin does not expose a `--universal2` flag, build per-architecture wheels and fuse them with `delocate`:
-
-1) Ensure Rust targets are installed:
+1) Build a release wheel:
 ```
-rustup target add aarch64-apple-darwin x86_64-apple-darwin
+maturin build --release
 ```
 
-2) Build both wheels into a dedicated directory (wheelhouse). Run these from the repository root (where Cargo.toml is):
+The wheel will be written to `target/wheels/gassim-VERSION-cp313-abi3-macosx_ARCH.whl`.
+
+2) Test the wheel locally (important!):
 ```
-maturin build --release --target aarch64-apple-darwin -o wheelhouse
-maturin build --release --target x86_64-apple-darwin  -o wheelhouse
+python3 -m pip install --force-reinstall target/wheels/gassim-*.whl
+python3 -c "import gassim; from gassim import GasSim; print('GasSim ok')"
 ```
 
-3) Install delocate and fuse the two wheels into a single universal2 wheel:
+3) Run the example to ensure it works:
 ```
-python -m pip install -U delocate
+python3 examples/half_box_relax.py
+```
 
-# Identify the two platform-specific wheel filenames under wheelhouse/, then merge:
-delocate-merge -w wheelhouse \
-  wheelhouse/gassim-<ver>-cp313-abi3-macosx_11_0_arm64.whl \
-  wheelhouse/gassim-<ver>-cp313-abi3-macosx_10_12_x86_64.whl
-# Output: a new universal2 wheel is written into wheelhouse/ with an automatically determined name (macosx_universal2 tag).
-```
-Notes:
-- Replace `<ver>` with the actual version in the filenames.
-- The exact macOS platform tags may vary (e.g., `macosx_12_0_arm64`). Pass the two per-arch wheels you just built; `delocate-merge` writes a new universal2 wheel into `wheelhouse/` with an automatically determined name.
-
-4) Quick local install test of the universal2 wheel (from the repo root):
-```
-pip install --force-reinstall wheelhouse/gassim-*-macosx_10_12_universal2.whl
-python -c "import gassim; from gassim import GasSim; print('GasSim ok')"
-```
+If this completes without errors and prints results like "Final internal energy U = ...", the wheel is ready.
 
 ---
 
 ## 5) (Optional) Test on TestPyPI First
 
-Create an account on https://test.pypi.org/ and generate an API token.
+1) Create an account at https://test.pypi.org/ and generate an API token.
 
-Upload the fused universal2 wheel with `twine`:
+2) Upload to TestPyPI:
 ```
-python -m pip install -U twine
+python3 -m pip install -U twine
 export TWINE_USERNAME="__token__"
 export TWINE_PASSWORD="pypi-AgENdGVzdC5weXBpLm9yZwIk..."  # your TestPyPI token
-twine upload --repository testpypi wheelhouse/gassim-*-macosx_10_12_universal2.whl
+twine upload --repository testpypi target/wheels/gassim-*.whl
 ```
 
-Install from TestPyPI in a clean venv to verify:
+3) Test install from TestPyPI in a clean venv:
 ```
-python -m venv .venv
-source .venv/bin/activate
+python3 -m venv test_venv
+source test_venv/bin/activate
 pip install --index-url https://test.pypi.org/simple/ --extra-index-url https://pypi.org/simple gassim
-python -c "import gassim; from gassim import GasSim; print('GasSim from TestPyPI ok')"
+python3 -c "import gassim; print('TestPyPI install works')"
 deactivate
+rm -rf test_venv
 ```
 
 ---
@@ -115,63 +96,71 @@ deactivate
 
 1) Create an API token at https://pypi.org/ (Account Settings -> API tokens).
 
-2) Upload the fused universal2 wheel with `twine`:
+2) Upload to PyPI:
 ```
-python -m pip install -U twine
 export TWINE_USERNAME="__token__"
-export TWINE_PASSWORD="pypi-AgENdH..."  # your PyPI token
-twine upload wheelhouse/gassim-*-macosx_10_12_universal2.whl
+export TWINE_PASSWORD="pypi-AgENdH..."  # your PyPI production token
+twine upload target/wheels/gassim-*.whl
 ```
-
-This uploads the already-built universal2 wheel to PyPI without rebuilding.
 
 ---
 
-## 7) Post-Publish Sanity Check
+## 7) Post-Publish Verification
 
-In a fresh virtual environment:
-
+Test in a fresh environment:
 ```
-python -m venv .venv
-source .venv/bin/activate
+python3 -m venv verify_venv
+source verify_venv/bin/activate
 pip install gassim
-python - <<'PY'
-from gassim import GasSim
-sim = GasSim(num_particles=8, box_size=[10.0, 10.0, 10.0], radius=0.5, mass=1.0, dim=3, seed=1)
-sim.advance_to(0.1)
-print("positions:", sim.get_positions().shape, "velocities:", sim.get_velocities().shape)
-PY
+python3 -c "from gassim import GasSim; sim = GasSim(num_particles=8, box_size=[10.0, 10.0, 10.0], radius=0.5, mass=1.0, dim=3, seed=1); sim.advance_to(0.1); print('Published wheel works!')"
 deactivate
+rm -rf verify_venv
 ```
-
-If this runs, the published wheel is installable and functional.
 
 ---
 
-## 8) Notes and Tips
+## 8) Advanced: Universal2 Wheels (Optional)
 
-- Universal2 builds: maturin does not provide a built-in `--universal2` flag on your setup. Use the two-arch build + `delocate-merge` method described above to produce a `macosx_universal2` wheel.
-- macOS deployment target: maturin typically chooses a reasonable default. If you need broader compatibility, you can export `MACOSX_DEPLOYMENT_TARGET`, e.g.:
-  - export MACOSX_DEPLOYMENT_TARGET=11.0
-- Source distribution (sdist): optional at this stage. To produce one for upload with `twine`:
-  - maturin sdist -m pyproject.toml
-- Credentials: keep your PyPI token in environment variables or a local keychain. Never commit tokens.
-- Re-publish same version: PyPI will reject overwriting existing files. If you need to publish again, bump the version.
+For broader compatibility across Intel and Apple Silicon Macs:
 
-That’s it. This process stays on one macOS laptop and produces a single universal2 wheel for Python 3.13, keeping the early release flow simple and reliable.
+1) Install additional Rust targets:
+```
+rustup target add aarch64-apple-darwin x86_64-apple-darwin
+```
 
-## 9) Troubleshooting
+2) Build both architectures:
+```
+mkdir wheelhouse
+maturin build --release --target aarch64-apple-darwin -o wheelhouse
+maturin build --release --target x86_64-apple-darwin -o wheelhouse
+```
 
-- Error: “the manifest-path must be a path to a Cargo.toml file”
-  - Cause: running `maturin build` outside the repository root, or passing `-m pyproject.toml` to a subdirectory.
-  - Fix: run commands from the repository root (where `Cargo.toml` lives) and omit `-m pyproject.toml` for `build`:
-    - maturin build --release --target aarch64-apple-darwin -o wheelhouse
-    - maturin build --release --target x86_64-apple-darwin  -o wheelhouse
-  - Sanity check: `ls Cargo.toml` should list the manifest in your current directory.
+3) Merge using delocate:
+```
+python3 -m pip install -U delocate
+ls wheelhouse/  # Check actual filenames
+delocate-merge -w wheelhouse wheelhouse/gassim-*-arm64.whl wheelhouse/gassim-*-x86_64.whl
+```
 
-- Error: cannot find Rust target triple
-  - Fix: install targets with
-    - rustup target add aarch64-apple-darwin x86_64-apple-darwin
+4) Upload the universal2 wheel:
+```
+twine upload wheelhouse/gassim-*-universal2.whl
+```
 
-- delocate-merge tag mismatch
-  - The per-arch wheel tags may differ (e.g., `macosx_12_0_arm64`, `macosx_10_15_x86_64`). Use the exact filenames output by your `maturin build` runs when calling `delocate-merge`.
+---
+
+## 9) Important Notes
+
+- **Always rebuild and reinstall after code changes**: Python will cache the old extension module. Use `--force-reinstall` to ensure the latest version is loaded.
+- **Test thoroughly**: Run the example script after each wheel build/install to catch issues early.
+- **Keep it simple**: Single-architecture wheels work fine for most use cases. Only use universal2 if you need broad compatibility.
+- **Version bumps**: PyPI won't accept re-uploads of the same version. Bump the version in Cargo.toml for each release.
+
+## 10) Troubleshooting
+
+- **"out of bounds" errors**: Ensure you've rebuilt and reinstalled the wheel after recent code changes.
+- **Import errors**: Check that you're using the correct Python environment where you installed the wheel.
+- **Build errors**: Verify you're running maturin from the repository root (where Cargo.toml is located).
+- **Platform tag mismatches**: Use `ls target/wheels/` or `ls wheelhouse/` to see actual filenames when using delocate-merge.
+
+This process keeps releases simple and reliable while maintaining high quality through testing at each step.
