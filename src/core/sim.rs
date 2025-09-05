@@ -1,7 +1,7 @@
 use crate::core::particle::DIM;
 use crate::core::{Event, EventKind, Particle};
 use crate::error::{Error, Result};
-use rand::{rngs::StdRng, Rng, SeedableRng};
+use rand::{rng, rngs::StdRng, Rng, SeedableRng};
 use std::cmp::Reverse;
 use std::collections::BinaryHeap;
 
@@ -57,7 +57,7 @@ impl Simulation {
 
         let mut rng: StdRng = match seed {
             Some(s) => SeedableRng::seed_from_u64(s),
-            None => SeedableRng::from_entropy(),
+            None => SeedableRng::seed_from_u64(rng().random()),
         };
 
         // Rejection sample non-overlapping initial positions
@@ -78,7 +78,7 @@ impl Simulation {
                 for (k, r_k) in r.iter_mut().enumerate() {
                     let lo = radius;
                     let hi = box_size[k] - radius;
-                    *r_k = rng.gen_range(lo..=hi);
+                    *r_k = rng.random_range(lo..=hi);
                 }
                 if !overlaps_existing(&particles, &r, radius) {
                     break r;
@@ -87,7 +87,7 @@ impl Simulation {
 
             // Random initial velocities in [-1, 1] for each component
             let mut v = [0.0_f64; DIM];
-            v.iter_mut().for_each(|x| *x = rng.gen_range(-1.0..=1.0));
+            v.iter_mut().for_each(|x| *x = rng.random_range(-1.0..=1.0));
 
             particles.push(Particle::new(id, r, v, radius, mass)?);
         }
