@@ -9,6 +9,8 @@ name = "gassim"
 crate-type = ["cdylib", "rlib"]
 
 [dependencies]
-pyo3 = "0.25.0"
+pyo3 = { version = "0.26", features = ["extension-module", "abi3-py313"] }
+numpy = "0.26"
 thiserror = "1.0"
 ordered-float = "4"
+rand = "0.8"

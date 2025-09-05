@@ -8,6 +8,8 @@ The project is divided into several progressive phases, each with clear goals, k
 
 ## Phase 0: Foundational Architecture — A Validated Hard-Sphere Gas Simulator (NVE Ensemble)
 
+Status: Completed (2025-09-05)
+
 ### Goal
 Build a physically faithful and computationally robust event-driven simulation core. This serves as the foundation for all subsequent features.
 
@@ -35,6 +37,30 @@ Build a physically faithful and computationally robust event-driven simulation c
 - Distribution Check: At equilibrium, the particle velocity distribution conforms to the Maxwell–Boltzmann distribution.
 - Isotropy: At equilibrium, average kinetic energy is equal in all directions (⟨vx²⟩ ≈ ⟨vy²⟩ ≈ ⟨vz²⟩).
 
+### Current Status (2025-09-05)
+- Status: Completed.
+- Rust core implemented:
+  - Event-driven MD engine with priority queue, deterministic ordering, collision invalidation via `collision_count`.
+  - Analytical P2P and static P2W collision prediction; elastic P2P resolution; specular P2W reflection.
+  - Lazy drift to event time; numeric tolerances and bounds safety.
+  - Initialization via non-overlapping placement and random velocities; kinetic energy diagnostic.
+- Python API (PyO3 ≥ 0.26, abi3-py313) implemented:
+  - `GasSim.__new__(num_particles, box_size, radius, mass, dim, seed)`
+  - `advance_to(target_time)` (releases GIL via `Python::detach`)
+  - `get_positions()`, `get_velocities()` returning NumPy arrays (numpy crate 0.26).
+- Validation:
+  - Energy conservation test passes (NVE).
+  - Isotropy check passes after mixing.
+  - Unit tests for particles, events, and simulation math pass.
+- Tooling/infra:
+  - Toolchain upgraded to Python ≥ 3.13; `pyo3 = "0.26"` with `["extension-module","abi3-py313"]`; `numpy = "0.26"`.
+  - No environment variables required for build/test.
+  - CI (GitHub Actions) runs fmt, clippy (warnings as errors), tests, and docs across Ubuntu/macOS/Windows.
+- Code references:
+  - Core engine: `src/core/sim.rs`
+  - Python bindings: `src/lib.rs`
+  - Integration tests: `tests/phase0.rs`
+  - Build guide: `docs/BUILD.md`
 ---
 
 ## Phase 1: Introducing Mechanical Work — The Moving Piston

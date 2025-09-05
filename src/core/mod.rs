@@ -7,6 +7,8 @@
 
 pub mod event;
 pub mod particle;
+pub mod sim;
 
 pub use event::{Event, EventKind};
 pub use particle::Particle;
+pub use sim::Simulation;
