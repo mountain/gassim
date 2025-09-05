@@ -8,21 +8,48 @@ use std::collections::BinaryHeap;
 /// Small numeric tolerance for time and geometric checks.
 const EPS_TIME: f64 = 1e-12;
 
-/// Simulation domain: static axis-aligned box in D=3 with adiabatic walls.
+/// Kinematics for an axis-aligned planar wall with piecewise-constant velocity.
+/// Position evolves as: pos(t) = base_pos + u * (t - base_time)
+#[derive(Debug, Clone, Copy)]
+struct WallKinematics {
+    base_pos: f64,
+    base_time: f64,
+    u: f64,
+}
+
+impl WallKinematics {
+    #[inline]
+    fn pos_at(&self, t: f64) -> f64 {
+        self.base_pos + self.u * (t - self.base_time)
+    }
+}
+
+/// Simulation domain: axis-aligned box in D=3 with adiabatic walls (Phase 0) and
+/// optional moving piston (Phase 1).
 ///
-/// Walls are implicitly represented by six planes:
-/// - For axis k in {0,1,2}, wall_id = 2*k (min wall at x_k = 0), wall_id = 2*k+1 (max wall at x_k = L_k).
+/// Walls are represented by six planes (for axis k in {0,1,2}):
+/// - wall_id = 2*k     : min wall at coordinate along axis k
+/// - wall_id = 2*k + 1 : max wall at coordinate along axis k
 #[derive(Debug)]
 pub struct Simulation {
     time_now: f64,
     box_size: [f64; DIM],
     pub particles: Vec<Particle>,
     pq: BinaryHeap<Reverse<Event>>,
+
+    // Phase 1: moving piston/walls
+    wall_min: [WallKinematics; DIM],
+    wall_max: [WallKinematics; DIM],
+
+    // Measurements (Phase 1)
+    work_total: f64,                  // cumulative mechanical work on gas
+    pressure_events: Vec<(f64, f64)>, // (time, |impulse|) on piston wall
+    piston_wall_id: Option<u32>,      // which wall is considered the piston (for pressure history)
 }
 
 impl Simulation {
     /// Create a new simulation with `num_particles` hard spheres of identical `radius` and `mass`
-    /// inside a static axis-aligned box with edge lengths `box_size` (each >= 2*radius).
+    /// inside an axis-aligned box with edge lengths `box_size` (each >= 2*radius).
     ///
     /// Particles are placed with simple rejection sampling to avoid initial overlap.
     /// Initial velocities are sampled uniformly in [-1, 1] for each component.
@@ -92,11 +119,32 @@ impl Simulation {
             particles.push(Particle::new(id, r, v, radius, mass)?);
         }
 
+        // Initialize static walls at t=0 with u=0
+        let mut wall_min = [WallKinematics {
+            base_pos: 0.0,
+            base_time: 0.0,
+            u: 0.0,
+        }; DIM];
+        let mut wall_max = [WallKinematics {
+            base_pos: 0.0,
+            base_time: 0.0,
+            u: 0.0,
+        }; DIM];
+        for k in 0..DIM {
+            wall_min[k].base_pos = 0.0;
+            wall_max[k].base_pos = box_size[k];
+        }
+
         let mut sim = Self {
             time_now: 0.0,
             box_size,
             particles,
             pq: BinaryHeap::new(),
+            wall_min,
+            wall_max,
+            work_total: 0.0,
+            pressure_events: Vec::new(),
+            piston_wall_id: None,
         };
 
         sim.schedule_initial_events()?;
@@ -123,11 +171,49 @@ impl Simulation {
         self.particles.iter().map(|p| p.v).collect()
     }
 
+    /// Phase 1: Set a wall's (piston) normal velocity. Velocity is piecewise-constant from the current time.
+    ///
+    /// - `wall_id` in [0, 5]: 2*k for min wall, 2*k+1 for max wall along axis k.
+    /// - `velocity` is the wall coordinate rate along the axis.
+    ///
+    /// This call re-bases the wall position at the current time and updates the event queue.
+    pub fn set_piston_velocity(&mut self, wall_id: u32, velocity: f64) -> Result<()> {
+        let (axis, is_max) = wall_axis_side(wall_id);
+        if axis >= DIM {
+            return Err(Error::InvalidParam("invalid wall_id".into()));
+        }
+        // Re-base at current time
+        if is_max {
+            let cur_pos = self.wall_max[axis].pos_at(self.time_now);
+            self.wall_max[axis].base_pos = cur_pos;
+            self.wall_max[axis].base_time = self.time_now;
+            self.wall_max[axis].u = velocity;
+        } else {
+            let cur_pos = self.wall_min[axis].pos_at(self.time_now);
+            self.wall_min[axis].base_pos = cur_pos;
+            self.wall_min[axis].base_time = self.time_now;
+            self.wall_min[axis].u = velocity;
+        }
+        // Mark this wall as the piston for pressure history
+        self.piston_wall_id = Some(wall_id);
+        // Rebuild events as wall kinematics changed
+        self.rebuild_event_queue()
+    }
+
+    /// Phase 1: Total mechanical work done on gas by the moving piston/walls so far.
+    pub fn work_total(&self) -> f64 {
+        self.work_total
+    }
+
+    /// Phase 1: Return a copy of pressure events recorded on the piston wall as (time, |impulse|).
+    pub fn pressure_events(&self) -> Vec<(f64, f64)> {
+        self.pressure_events.clone()
+    }
+
     /// Advance the simulation to `target_time` (must be ≥ current time).
     ///
-    /// This implementation drifts all particles to each processed event time (simpler and robust
-    /// for Phase 0 with small-to-medium N). It uses collision-count based invalidation to
-    /// discard stale queue entries.
+    /// This implementation drifts all particles to each processed event time (full drift).
+    /// It uses collision-count based invalidation to discard stale queue entries.
     pub fn advance_to(&mut self, target_time: f64) -> Result<()> {
         if !target_time.is_finite() {
             return Err(Error::InvalidParam("target_time must be finite".into()));
@@ -208,10 +294,10 @@ impl Simulation {
         self.particles.iter().map(|p| p.kinetic_energy()).sum()
     }
 
-    /// Rebuild the event queue from the current particle states and box.
+    /// Rebuild the event queue from the current particle states and wall kinematics.
     ///
     /// This should be called after externally modifying positions/velocities
-    /// (e.g., via Python setters) to ensure event times are consistent.
+    /// or wall kinematics to ensure event times are consistent.
     pub fn rebuild_event_queue(&mut self) -> Result<()> {
         self.pq.clear();
         self.schedule_initial_events()
@@ -340,15 +426,23 @@ impl Simulation {
 
     /// Predict the earliest absolute particle-wall collision time for particle i.
     /// Returns (t_abs, wall_id).
+    ///
+    /// Moving-wall kinematics are handled via relative velocities:
+    /// - Min wall: (x - pos_min_now) + (v_x - u_min) t = radius
+    /// - Max wall: (pos_max_now - x) + (u_max - v_x) t = radius
     fn predict_p2w_time(&self, i: usize) -> Option<(f64, u32)> {
         let p = &self.particles[i];
         let mut best_t = f64::INFINITY;
         let mut best_wall: Option<u32> = None;
 
-        for (k, ((&x, &v), &l)) in p.r.iter().zip(&p.v).zip(&self.box_size).enumerate() {
-            if v < -EPS_TIME {
-                // Approaching min wall at 0: contact when x + v t = radius
-                let t_rel = (p.radius - x) / v; // v is negative
+        for k in 0..DIM {
+            // Min wall on axis k
+            let pos_min = self.wall_min[k].pos_at(self.time_now);
+            let u_min = self.wall_min[k].u;
+            let s0_min = p.r[k] - pos_min;
+            let rel_min = p.v[k] - u_min;
+            if rel_min < -EPS_TIME {
+                let t_rel = (p.radius - s0_min) / rel_min; // rel_min negative
                 if t_rel > EPS_TIME {
                     let t_abs = self.time_now + t_rel;
                     if t_abs < best_t {
@@ -357,9 +451,14 @@ impl Simulation {
                     }
                 }
             }
-            if v > EPS_TIME {
-                // Approaching max wall at L: contact when x + v t = L - radius
-                let t_rel = (l - p.radius - x) / v; // v is positive
+
+            // Max wall on axis k
+            let pos_max = self.wall_max[k].pos_at(self.time_now);
+            let u_max = self.wall_max[k].u;
+            let s0_max = pos_max - p.r[k];
+            let rel_max = u_max - p.v[k];
+            if rel_max < -EPS_TIME {
+                let t_rel = (p.radius - s0_max) / rel_max; // rel_max negative
                 if t_rel > EPS_TIME {
                     let t_abs = self.time_now + t_rel;
                     if t_abs < best_t {
@@ -373,7 +472,8 @@ impl Simulation {
         best_wall.map(|w| (best_t, w))
     }
 
-    /// Drift all particles to the specified absolute time by linear motion.
+    /// Drift all particles to the specified absolute time by linear motion,
+    /// then safety-clamp to the dynamic domain at that time.
     fn drift_all(&mut self, to_time: f64) -> Result<()> {
         if to_time < self.time_now - EPS_TIME {
             return Err(Error::InvalidParam("cannot drift backwards in time".into()));
@@ -382,17 +482,30 @@ impl Simulation {
         if dt.abs() <= EPS_TIME {
             return Ok(());
         }
+
+        // Pre-compute dynamic wall positions at to_time
+        let mut lo_bound = [0.0_f64; DIM];
+        let mut hi_bound = [0.0_f64; DIM];
+        for k in 0..DIM {
+            lo_bound[k] = self.wall_min[k].pos_at(to_time);
+            hi_bound[k] = self.wall_max[k].pos_at(to_time);
+            // Keep bounds sane within original box in case of extreme velocities
+            if lo_bound[k] < 0.0 {
+                lo_bound[k] = 0.0;
+            }
+            if hi_bound[k] > self.box_size[k] {
+                hi_bound[k] = self.box_size[k];
+            }
+        }
+
         for p in &mut self.particles {
             for k in 0..DIM {
-                let lo = p.radius;
-                let hi = self.box_size[k] - p.radius;
-
                 // Linear drift
                 p.r[k] += p.v[k] * dt;
 
-                // Safety clamp: if position is outside bounds, clamp to bounds.
-                // This is a fallback for numerical drift or stale events.
-                // The proper wall collision handling should be via P2W events.
+                // Safety clamp to current dynamic domain
+                let lo = lo_bound[k] + p.radius;
+                let hi = hi_bound[k] - p.radius;
                 if p.r[k] < lo {
                     p.r[k] = lo;
                 } else if p.r[k] > hi {
@@ -443,20 +556,53 @@ impl Simulation {
         Ok(())
     }
 
-    /// Resolve a particle-wall collision by specular reflection on the hit axis.
+    /// Resolve a particle-wall collision with a possibly moving wall (piston).
+    ///
+    /// Reflection is done in the wall frame and transformed back:
+    /// v_x' = 2 u_w - v_x (normal component only). Tangential components unchanged (plane is axis-aligned).
     fn resolve_p2w(&mut self, i: usize, wall_id: u32) -> Result<()> {
         let (axis, is_max) = wall_axis_side(wall_id);
-        // Mirror reflection: flip the normal component
-        self.particles[i].v[axis] = -self.particles[i].v[axis];
 
-        // Snap position to the exact contact plane
-        let lo = self.particles[i].radius;
-        let hi = self.box_size[axis] - self.particles[i].radius;
-        if is_max {
-            self.particles[i].r[axis] = hi;
+        // Wall velocity and position at the current time (event time)
+        let (u_w, pos_now) = if is_max {
+            (
+                self.wall_max[axis].u,
+                self.wall_max[axis].pos_at(self.time_now),
+            )
         } else {
-            self.particles[i].r[axis] = lo;
+            (
+                self.wall_min[axis].u,
+                self.wall_min[axis].pos_at(self.time_now),
+            )
+        };
+
+        // Pre-collision normal component
+        let v_before = self.particles[i].v[axis];
+
+        // Moving mirror reflection along normal
+        let v_after = 2.0 * u_w - v_before;
+        self.particles[i].v[axis] = v_after;
+
+        // Snap position to the exact contact plane accounting for radius
+        if is_max {
+            self.particles[i].r[axis] = pos_now - self.particles[i].radius;
+        } else {
+            self.particles[i].r[axis] = pos_now + self.particles[i].radius;
         }
+
+        // Measurements for Phase 1
+        // Momentum impulse on particle along normal
+        let m = self.particles[i].mass;
+        let delta_p = m * (v_after - v_before); // signed impulse on particle
+        if let Some(piston_id) = self.piston_wall_id {
+            if piston_id == wall_id {
+                // Accumulate absolute impulse for pressure proxy
+                self.pressure_events.push((self.time_now, delta_p.abs()));
+            }
+        }
+        // Mechanical work done on gas by the moving wall: W += u_w * Δp (wall velocity dot impulse)
+        self.work_total += u_w * delta_p;
+
         Ok(())
     }
 }
@@ -534,6 +680,21 @@ mod tests {
         // Radii sum = 0.4, distance = 4.0, need to reduce to 0.4 => gap to close = 3.6, relative speed = 2, t = 1.8
         let t = sim.predict_p2p_time(0, 1).expect("should collide");
         assert!((t - 1.8).abs() < 1e-12);
+        Ok(())
+    }
+
+    #[test]
+    fn piston_smoke_and_work_accumulates() -> Result<()> {
+        let mut sim = Simulation::new(16, [10.0, 10.0, 10.0], 0.2, 1.0, Some(123))?;
+        sim.advance_to(0.5)?;
+        // Set x-max wall (axis 0 max => wall_id = 1) to move inward slowly
+        sim.set_piston_velocity(1, -0.05)?;
+        let w0 = sim.work_total();
+        sim.advance_to(5.0)?;
+        let w1 = sim.work_total();
+        assert!(w1.is_finite());
+        // Expect some collisions with piston; work magnitude should grow or equal
+        assert!(w1 != w0 || !sim.pressure_events().is_empty());
         Ok(())
     }
 }

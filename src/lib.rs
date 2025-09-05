@@ -156,6 +156,55 @@ impl GasSim {
         self.sim.rebuild_event_queue().map_err(py_err)?;
         Ok(())
     }
+
+    /// Phase 1: Define a moving piston by setting a wall's normal velocity.
+    ///
+    /// Parameters
+    /// - wall_id: integer in [0, 5] indexing the 6 axis-aligned walls
+    ///            2*k is the min wall on axis k; 2*k+1 is the max wall on axis k
+    /// - velocity: wall speed along its outward normal (piecewise-constant from call time)
+    ///
+    /// Errors: raises ValueError on invalid wall_id.
+    fn set_piston(&mut self, wall_id: u32, velocity: f64) -> PyResult<()> {
+        self.sim
+            .set_piston_velocity(wall_id, velocity)
+            .map_err(py_err)
+    }
+
+    /// Phase 1: Return the cumulative mechanical work done on the gas by moving walls.
+    fn get_work_done(&self) -> PyResult<f64> {
+        Ok(self.sim.work_total())
+    }
+
+    /// Phase 1: Return a (M, 2) NumPy array of [time, |impulse|] events recorded on the piston wall.
+    ///
+    /// Parameters
+    /// - window: if provided, only events with time >= (current_time - window) are returned.
+    #[pyo3(signature = (window=None))]
+    fn get_pressure_history<'py>(
+        &self,
+        py: Python<'py>,
+        window: Option<f64>,
+    ) -> PyResult<Py<PyArray2<f64>>> {
+        let events = self.sim.pressure_events();
+        let now = self.sim.time();
+        let filtered: Vec<(f64, f64)> = match window {
+            Some(w) => {
+                if !w.is_finite() || w < 0.0 {
+                    return Err(py_err("window must be a non-negative finite float"));
+                }
+                events.into_iter().filter(|(t, _)| *t >= now - w).collect()
+            }
+            None => events,
+        };
+        let m = filtered.len();
+        let mut arr = Array2::<f64>::zeros((m, 2));
+        for (i, (t, imp)) in filtered.into_iter().enumerate() {
+            arr[[i, 0]] = t;
+            arr[[i, 1]] = imp;
+        }
+        Ok(arr.into_pyarray(py).to_owned().into())
+    }
 }
 
 /// The gassim Python module entry point.

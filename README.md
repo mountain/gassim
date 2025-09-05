@@ -11,6 +11,12 @@ Phase 0 delivers a validated NVE (adiabatic, static box) simulator with:
 
 For roadmap details, see docs/plan.md and docs/design.md.
 
+Phase 1 adds:
+- Moving piston (axis-aligned moving wall with piecewise-constant velocity)
+- Mechanical work accumulation on the gas
+- Pressure proxy via impulse events on the piston wall
+- Python API additions: set_piston(wall_id, velocity), get_work_done(), get_pressure_history(window=None)
+
 ## Install and Build (Local Development)
 
 Requirements:
@@ -47,6 +53,31 @@ from gassim import GasSim
 sim = GasSim(num_particles=64, box_size=[20.0, 20.0, 20.0], radius=0.5, mass=1.0, dim=3, seed=42)
 sim.advance_to(1.0)
 print("positions:", sim.get_positions().shape, "velocities:", sim.get_velocities().shape)
+PY
+```
+
+## Example: Piston Compression (Phase 1)
+
+A simple experiment that drives a piston (the x-max wall) inward at a slow, constant speed and queries work and a pressure proxy:
+
+```
+python - <<'PY'
+from gassim import GasSim
+sim = GasSim(num_particles=128, box_size=[20.0, 20.0, 20.0], radius=0.2, mass=1.0, dim=3, seed=1)
+
+# Let system mix briefly with static walls
+sim.advance_to(0.5)
+
+# Set piston on x-max wall (axis 0, max side => wall_id = 1) to move inward
+sim.set_piston(1, -0.05)
+
+# Advance and query measurements
+sim.advance_to(10.0)
+print("work:", sim.get_work_done())
+
+# Last 5 time units of piston impulse events (pressure proxy)
+hist = sim.get_pressure_history(window=5.0)
+print("pressure events (time, |impulse|) rows:", hist.shape)
 PY
 ```
 
