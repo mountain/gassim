@@ -45,6 +45,10 @@ pub struct Simulation {
     work_total: f64,                  // cumulative mechanical work on gas
     pressure_events: Vec<(f64, f64)>, // (time, |impulse|) on piston wall
     piston_wall_id: Option<u32>,      // which wall is considered the piston (for pressure history)
+
+    // Phase 1.5: simple histories for windowed diagnostics
+    energy_history: Vec<(f64, f64)>, // (time, kinetic_energy)
+    work_history: Vec<(f64, f64)>,   // (time, work_total snapshot)
 }
 
 impl Simulation {
@@ -145,7 +149,13 @@ impl Simulation {
             work_total: 0.0,
             pressure_events: Vec::new(),
             piston_wall_id: None,
+            energy_history: Vec::new(),
+            work_history: Vec::new(),
         };
+        // Initial snapshots at t=0
+        let u0 = sim.kinetic_energy();
+        sim.energy_history.push((sim.time_now, u0));
+        sim.work_history.push((sim.time_now, sim.work_total));
 
         sim.schedule_initial_events()?;
         Ok(sim)
@@ -210,6 +220,435 @@ impl Simulation {
         self.pressure_events.clone()
     }
 
+    /// Phase 1.5: Windowed mechanical pressure estimate on a wall using impulse history.
+    ///
+    /// Computes P ≈ (Σ |Δp|) / (A * Δt) over events within [time_now - window, time_now],
+    /// where A is the wall area (product of the two orthogonal box lengths).
+    ///
+    /// Limitations:
+    /// - Currently only supports the active piston wall (if set). Requesting a different wall_id
+    ///   returns InvalidParam until per-wall histories are implemented.
+    pub fn mechanical_pressure(&self, window: f64, wall_id: u32) -> Result<f64> {
+        if !window.is_finite() || window <= 0.0 {
+            return Err(crate::error::Error::InvalidParam(
+                "window must be a positive finite float".into(),
+            ));
+        }
+        let Some(piston_id) = self.piston_wall_id else {
+            return Err(crate::error::Error::InvalidParam(
+                "no piston wall configured; call set_piston_velocity first".into(),
+            ));
+        };
+        if wall_id != piston_id {
+            return Err(crate::error::Error::InvalidParam(
+                "mechanical_pressure currently supports only the active piston wall_id".into(),
+            ));
+        }
+        let t0 = self.time_now - window;
+        let sum_impulse: f64 = self
+            .pressure_events
+            .iter()
+            .filter(|(t, _)| *t >= t0)
+            .map(|(_, imp)| *imp)
+            .sum();
+        if sum_impulse == 0.0 {
+            return Err(crate::error::Error::DiagnosticInsufficientSamples(
+                "no piston impulse events in window",
+            ));
+        }
+        let area = self.area_for_wall(wall_id)?;
+        Ok(sum_impulse / (area * window))
+    }
+
+    /// Phase 1.5: Return total mechanical work and total heat (Phase 2: heat, currently 0.0).
+    pub fn work_heat(&self) -> (f64, f64) {
+        (self.work_total, 0.0)
+    }
+
+    /// Phase 1.5: Compute drift-removed temperature tensor diagonals and scalar T from current velocities.
+    ///
+    /// Returns (Txx, Tyy, Tzz, T_scalar, count). Requires at least 2 selected samples.
+    /// If `mask` is provided, it must have length N and select particles included in the statistics.
+    pub fn temperature_tensor(&self, mask: Option<&[bool]>) -> Result<(f64, f64, f64, f64, usize)> {
+        const D: usize = DIM;
+        let n = self.particles.len();
+        if n == 0 {
+            return Err(crate::error::Error::InvalidParam("no particles".into()));
+        }
+        if let Some(m) = mask {
+            if m.len() != n {
+                return Err(crate::error::Error::InvalidParam(
+                    "mask length must equal number of particles".into(),
+                ));
+            }
+        }
+        // Selection
+        let mut count: usize = 0;
+        let mut u = [0.0_f64; D];
+        for (idx, p) in self.particles.iter().enumerate() {
+            let selected = match mask {
+                Some(m) => m[idx],
+                None => true,
+            };
+            if selected {
+                count += 1;
+                for (k, uk) in u.iter_mut().enumerate() {
+                    *uk += p.v[k];
+                }
+            }
+        }
+        if count < 2 {
+            return Err(crate::error::Error::DiagnosticInsufficientSamples(
+                "need at least 2 samples for temperature tensor",
+            ));
+        }
+        for uk in u.iter_mut() {
+            *uk /= count as f64;
+        }
+
+        // Accumulate centered second moments
+        let m_ref = self.particles[0].mass;
+        let mut sum_cc_diag = [0.0_f64; D];
+        let mut sum_cc_trace = 0.0_f64;
+        for (idx, p) in self.particles.iter().enumerate() {
+            let selected = match mask {
+                Some(m) => m[idx],
+                None => true,
+            };
+            if !selected {
+                continue;
+            }
+            let mut c = [0.0_f64; D];
+            for k in 0..D {
+                c[k] = p.v[k] - u[k];
+            }
+            for k in 0..D {
+                let ck2 = c[k] * c[k];
+                sum_cc_diag[k] += ck2;
+                sum_cc_trace += ck2;
+            }
+        }
+        // Temperature tensor components and scalar T (k_B = 1 units)
+        let t_xx = m_ref * sum_cc_diag[0] / (count as f64);
+        let t_yy = m_ref * sum_cc_diag[1] / (count as f64);
+        let t_zz = m_ref * sum_cc_diag[2] / (count as f64);
+        let t_scalar = (m_ref * sum_cc_trace) / ((DIM as f64) * (count as f64));
+        Ok((t_xx, t_yy, t_zz, t_scalar, count))
+    }
+
+    /// Phase 1.5: Windowed −α/T rate using First Law closure (Phase 1 adiabatic approximation).
+    ///
+    /// Definition here uses the residual rate r = −(ΔU − ΔW) / (T̄ Δt)
+    /// over the window [time_now − window, time_now]. Heat Q=0 in Phase 1.
+    pub fn alpha_over_t(&self, window: f64) -> Result<f64> {
+        if !window.is_finite() || window <= 0.0 {
+            return Err(crate::error::Error::InvalidParam(
+                "window must be a positive finite float".into(),
+            ));
+        }
+        let t0 = self.time_now - window;
+        let u0 = self.value_at_or_before(&self.energy_history, t0).ok_or(
+            crate::error::Error::DiagnosticInsufficientSamples("insufficient U history for window"),
+        )?;
+        let w0 = self.value_at_or_before(&self.work_history, t0).ok_or(
+            crate::error::Error::DiagnosticInsufficientSamples("insufficient W history for window"),
+        )?;
+        let u_now = self.kinetic_energy();
+        let w_now = self.work_total;
+        let delta_u = u_now - u0;
+        let delta_w = w_now - w0;
+
+        // Use current scalar temperature as proxy T̄ (k_B = 1 units)
+        let (_tx, _ty, _tz, t_scalar, cnt) = self.temperature_tensor(None)?;
+        if t_scalar <= 0.0 || cnt < 2 {
+            return Err(crate::error::Error::DiagnosticInsufficientSamples(
+                "insufficient temperature statistics",
+            ));
+        }
+        Ok(-(delta_u - delta_w) / (t_scalar * window))
+    }
+
+    /// Search helper: last history value at or before t0.
+    fn value_at_or_before(&self, hist: &[(f64, f64)], t0: f64) -> Option<f64> {
+        // Linear scan backward (hist is append-only; small for tests)
+        for (t, v) in hist.iter().rev() {
+            if *t <= t0 {
+                return Some(*v);
+            }
+        }
+        None
+    }
+
+    /// Phase 1.5: Build histograms of velocity components for selected axes.
+    ///
+    /// Returns for each axis a pair (edges, counts) where:
+    /// - edges has length bins+1
+    /// - counts has length bins
+    pub fn velocity_histogram(
+        &self,
+        axes: &[usize],
+        bins: usize,
+        range: Option<(f64, f64)>,
+        mask: Option<&[bool]>,
+    ) -> Result<Vec<(Vec<f64>, Vec<f64>)>> {
+        if axes.is_empty() {
+            return Err(crate::error::Error::InvalidParam(
+                "axes must be non-empty".into(),
+            ));
+        }
+        for &ax in axes {
+            if ax >= DIM {
+                return Err(crate::error::Error::InvalidParam(
+                    "axis index out of bounds".into(),
+                ));
+            }
+        }
+        if bins < 1 {
+            return Err(crate::error::Error::InvalidParam(
+                "bins must be >= 1".into(),
+            ));
+        }
+        let n = self.particles.len();
+        if let Some(m) = mask {
+            if m.len() != n {
+                return Err(crate::error::Error::InvalidParam(
+                    "mask length must equal number of particles".into(),
+                ));
+            }
+        }
+        // Collect per-axis min/max if range not provided
+        let mut results = Vec::with_capacity(axes.len());
+        for &ax in axes {
+            let mut vmin = f64::INFINITY;
+            let mut vmax = f64::NEG_INFINITY;
+            let mut count_sel = 0usize;
+            for (idx, p) in self.particles.iter().enumerate() {
+                let selected = match mask {
+                    Some(m) => m[idx],
+                    None => true,
+                };
+                if !selected {
+                    continue;
+                }
+                count_sel += 1;
+                let v = p.v[ax];
+                if v < vmin {
+                    vmin = v;
+                }
+                if v > vmax {
+                    vmax = v;
+                }
+            }
+            if count_sel == 0 {
+                return Err(crate::error::Error::DiagnosticInsufficientSamples(
+                    "no samples selected for histogram",
+                ));
+            }
+            let (lo, hi) = match range {
+                Some((a, b)) => {
+                    if !a.is_finite() || !b.is_finite() || a >= b {
+                        return Err(crate::error::Error::InvalidParam(
+                            "invalid histogram range".into(),
+                        ));
+                    }
+                    (a, b)
+                }
+                None => {
+                    if vmax <= vmin {
+                        // Degenerate; widen a bit around vmin
+                        (vmin - 1.0, vmax + 1.0)
+                    } else {
+                        (vmin, vmax)
+                    }
+                }
+            };
+            let width = (hi - lo) / (bins as f64);
+            let mut edges = Vec::with_capacity(bins + 1);
+            for j in 0..=bins {
+                edges.push(lo + (j as f64) * width);
+            }
+            let mut counts = vec![0.0f64; bins];
+            for (idx, p) in self.particles.iter().enumerate() {
+                let selected = match mask {
+                    Some(m) => m[idx],
+                    None => true,
+                };
+                if !selected {
+                    continue;
+                }
+                let v = p.v[ax];
+                let mut bin = ((v - lo) / width).floor() as isize;
+                if bin < 0 {
+                    bin = 0;
+                }
+                if bin as usize >= bins {
+                    bin = (bins as isize) - 1;
+                }
+                counts[bin as usize] += 1.0;
+            }
+            results.push((edges, counts));
+        }
+        Ok(results)
+    }
+
+    /// Phase 1.5: KL divergence between drift-removed component velocities and Gaussian model.
+    ///
+    /// For each requested axis, compute D_KL(P||Q) where:
+    /// - P is the empirical histogram of centered component c_k = v_k - <v_k>
+    /// - Q is Normal(0, σ²) with σ² = T/m, T the scalar temperature from temperature_tensor.
+    ///   Returns the mean D_KL over axes.
+    pub fn kl_stats(
+        &self,
+        bins: usize,
+        range: Option<(f64, f64)>,
+        axes: &[usize],
+        mask: Option<&[bool]>,
+    ) -> Result<f64> {
+        if axes.is_empty() {
+            return Err(crate::error::Error::InvalidParam(
+                "axes must be non-empty".into(),
+            ));
+        }
+        for &ax in axes {
+            if ax >= DIM {
+                return Err(crate::error::Error::InvalidParam(
+                    "axis index out of bounds".into(),
+                ));
+            }
+        }
+        if bins < 5 {
+            return Err(crate::error::Error::InvalidParam(
+                "bins must be >= 5".into(),
+            ));
+        }
+        // Selection and mean velocity
+        let n = self.particles.len();
+        if let Some(m) = mask {
+            if m.len() != n {
+                return Err(crate::error::Error::InvalidParam(
+                    "mask length must equal number of particles".into(),
+                ));
+            }
+        }
+        let mut count = 0usize;
+        let mut u = [0.0f64; DIM];
+        for (idx, p) in self.particles.iter().enumerate() {
+            let selected = match mask {
+                Some(m) => m[idx],
+                None => true,
+            };
+            if !selected {
+                continue;
+            }
+            count += 1;
+            for (k, uk) in u.iter_mut().enumerate() {
+                *uk += p.v[k];
+            }
+        }
+        if count < 5 {
+            return Err(crate::error::Error::DiagnosticInsufficientSamples(
+                "need at least 5 samples for KL",
+            ));
+        }
+        for uk in u.iter_mut() {
+            *uk /= count as f64;
+        }
+        // Scalar temperature and sigma^2 = T/m
+        let (_tx, _ty, _tz, t_scalar, _c) = self.temperature_tensor(mask)?;
+        let m_ref = self.particles[0].mass;
+        let sigma2 = t_scalar / m_ref;
+        if sigma2 <= 0.0 {
+            return Err(crate::error::Error::DiagnosticInsufficientSamples(
+                "non-positive variance for KL",
+            ));
+        }
+        let sigma = sigma2.sqrt();
+
+        let mut dkl_sum = 0.0f64;
+        let two_pi = std::f64::consts::PI * 2.0;
+        for &ax in axes {
+            // Choose histogram range
+            let (lo, hi) = match range {
+                Some((a, b)) => (a, b),
+                None => {
+                    // symmetric around 0 using ±5σ of centered c
+                    let r = 5.0 * sigma;
+                    (-r, r)
+                }
+            };
+            let width = (hi - lo) / (bins as f64);
+            let mut counts = vec![0.0f64; bins];
+            let mut total = 0.0f64;
+            for (idx, p) in self.particles.iter().enumerate() {
+                let selected = match mask {
+                    Some(m) => m[idx],
+                    None => true,
+                };
+                if !selected {
+                    continue;
+                }
+                let c = p.v[ax] - u[ax];
+                let mut bin = ((c - lo) / width).floor() as isize;
+                if bin < 0 {
+                    bin = 0;
+                }
+                if bin as usize >= bins {
+                    bin = (bins as isize) - 1;
+                }
+                counts[bin as usize] += 1.0;
+                total += 1.0;
+            }
+            if total <= 0.0 {
+                return Err(crate::error::Error::DiagnosticInsufficientSamples(
+                    "no samples in KL window",
+                ));
+            }
+            // D_KL = Σ p_j ln(p_j / q_j), approximate q_j by φ(center)*Δx
+            let mut dkl = 0.0f64;
+            for (j, cnt) in counts.iter().enumerate().take(bins) {
+                let p_j = *cnt / total;
+                if p_j == 0.0 {
+                    continue;
+                }
+                let center = lo + (j as f64 + 0.5) * width;
+                let q_density =
+                    (1.0 / (sigma * (two_pi).sqrt())) * (-center * center / (2.0 * sigma2)).exp();
+                let mut q_j = q_density * width;
+                if q_j < 1e-300 {
+                    q_j = 1e-300;
+                }
+                dkl += p_j * (p_j / q_j).ln();
+            }
+            dkl_sum += dkl;
+        }
+
+        Ok(dkl_sum / (axes.len() as f64))
+    }
+
+    /// Phase 1.5: append current (time, U) and (time, W) to histories.
+    #[inline]
+    fn record_snapshot(&mut self) {
+        let u = self.kinetic_energy();
+        self.energy_history.push((self.time_now, u));
+        self.work_history.push((self.time_now, self.work_total));
+        // Optional: cap history growth in future with down-sampling/compaction
+    }
+
+    /// Compute wall area for the given wall id (product of the two orthogonal box lengths).
+    fn area_for_wall(&self, wall_id: u32) -> Result<f64> {
+        let (axis, _is_max) = wall_axis_side(wall_id);
+        if axis >= DIM {
+            return Err(crate::error::Error::InvalidParam("invalid wall_id".into()));
+        }
+        let mut area = 1.0_f64;
+        for k in 0..DIM {
+            if k != axis {
+                area *= self.box_size[k];
+            }
+        }
+        Ok(area)
+    }
+
     /// Advance the simulation to `target_time` (must be ≥ current time).
     ///
     /// This implementation drifts all particles to each processed event time (full drift).
@@ -229,6 +668,8 @@ impl Simulation {
                 // No more events; drift to target_time and stop
                 self.drift_all(target_time)?;
                 self.time_now = target_time;
+                // Snapshot at target_time
+                self.record_snapshot();
                 break;
             };
 
@@ -238,6 +679,8 @@ impl Simulation {
                 // Next event occurs after the target; drift to target and stop
                 self.drift_all(target_time)?;
                 self.time_now = target_time;
+                // Snapshot at target_time
+                self.record_snapshot();
                 // Put the event back for future calls
                 self.pq.push(Reverse(ev));
                 break;
@@ -259,6 +702,8 @@ impl Simulation {
                     self.drift_all(t_ev)?;
                     self.time_now = t_ev;
                     self.resolve_p2p(ii, jj)?;
+                    // Snapshot after event resolution
+                    self.record_snapshot();
 
                     // Increment cc for involved
                     self.particles[ii].bump_collision_count();
@@ -278,6 +723,8 @@ impl Simulation {
                     self.drift_all(t_ev)?;
                     self.time_now = t_ev;
                     self.resolve_p2w(ii, wall_id)?;
+                    // Snapshot after event resolution/work accumulation
+                    self.record_snapshot();
 
                     self.particles[ii].bump_collision_count();
 

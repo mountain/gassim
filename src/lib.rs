@@ -1,12 +1,23 @@
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
+use pyo3::types::PyDict;
 
 pub mod core;
 pub mod error;
 
 use crate::core::Simulation;
+
+fn core_axes_default<const D: usize>() -> [usize; D] {
+    let mut out = [0usize; D];
+    let mut i = 0usize;
+    while i < D {
+        out[i] = i;
+        i += 1;
+    }
+    out
+}
 
 fn py_err<E: ToString>(e: E) -> PyErr {
     PyValueError::new_err(e.to_string())
@@ -204,6 +215,122 @@ impl GasSim {
             arr[[i, 1]] = imp;
         }
         Ok(arr.into_pyarray(py).to_owned().into())
+    }
+
+    /// Phase 1.5: Windowed mechanical pressure on a wall (currently: piston wall only)
+    ///
+    /// Parameters
+    /// - window: width of the time window (must be > 0)
+    /// - wall_id: integer in [0,5]; must match the active piston wall id
+    ///
+    /// Returns: scalar pressure estimate
+    fn get_mechanical_pressure(&self, window: f64, wall_id: u32) -> PyResult<f64> {
+        self.sim
+            .mechanical_pressure(window, wall_id)
+            .map_err(py_err)
+    }
+
+    /// Phase 1.5: Return total mechanical work and total heat (Phase 2 will populate heat).
+    fn get_work_heat(&self) -> PyResult<(f64, f64)> {
+        Ok(self.sim.work_heat())
+    }
+
+    /// Phase 1.5: Temperature tensor diagnostics with optional boolean mask.
+    ///
+    /// Returns: (Txx, Tyy, Tzz, T_scalar, count)
+    #[pyo3(signature = (mask=None))]
+    fn get_temperature_tensor(
+        &self,
+        mask: Option<PyReadonlyArray1<bool>>,
+    ) -> PyResult<(f64, f64, f64, f64, usize)> {
+        let mask_vec: Option<Vec<bool>> = match mask {
+            Some(m) => {
+                let slice = m.as_slice().map_err(py_err)?;
+                Some(slice.to_vec())
+            }
+            None => None,
+        };
+        let mask_opt = mask_vec.as_deref();
+        self.sim.temperature_tensor(mask_opt).map_err(py_err)
+    }
+
+    /// Phase 1.5: Velocity histograms for selected axes.
+    ///
+    /// Parameters
+    /// - axes: list of component indices (default: [0,1,2])
+    /// - bins: number of bins (default: 80)
+    /// - range: optional (min, max) for binning; defaults to min/max from data per axis
+    /// - mask: optional boolean mask of length N
+    ///
+    /// Returns: dict {axis_index: {"edges": np.ndarray, "counts": np.ndarray}}
+    #[pyo3(signature = (axes=None, bins=80, range=None, mask=None))]
+    fn get_velocity_histogram<'py>(
+        &self,
+        py: Python<'py>,
+        axes: Option<Vec<usize>>,
+        bins: usize,
+        range: Option<(f64, f64)>,
+        mask: Option<PyReadonlyArray1<'py, bool>>,
+    ) -> PyResult<Py<PyDict>> {
+        let default_axes: [usize; crate::core::particle::DIM] =
+            core_axes_default::<{ crate::core::particle::DIM }>();
+        let axes_vec: Vec<usize> = axes.unwrap_or_else(|| default_axes.to_vec());
+
+        let mask_vec: Option<Vec<bool>> = match mask {
+            Some(m) => Some(m.as_slice().map_err(py_err)?.to_vec()),
+            None => None,
+        };
+        let mask_opt = mask_vec.as_deref();
+
+        let results = self
+            .sim
+            .velocity_histogram(&axes_vec, bins, range, mask_opt)
+            .map_err(py_err)?;
+        let out = PyDict::new(py);
+        for (idx, (edges, counts)) in results.into_iter().enumerate() {
+            let ax = axes_vec[idx];
+            let edges_arr = edges.into_pyarray(py);
+            let counts_arr = counts.into_pyarray(py);
+            let inner = PyDict::new(py);
+            inner.set_item("edges", edges_arr)?;
+            inner.set_item("counts", counts_arr)?;
+            out.set_item(ax, inner)?;
+        }
+        Ok(out.into())
+    }
+
+    /// Phase 1.5: KL divergence diagnostic (mean over requested axes).
+    ///
+    /// Parameters
+    /// - bins: histogram bins (>= 5 recommended)
+    /// - range: optional (min, max) over centered component c; default uses ±5σ
+    /// - axes: list of component indices (default: [0,1,2])
+    /// - mask: optional boolean mask of length N
+    #[pyo3(signature = (bins=80, range=None, axes=None, mask=None))]
+    fn get_kl_stats(
+        &self,
+        bins: usize,
+        range: Option<(f64, f64)>,
+        axes: Option<Vec<usize>>,
+        mask: Option<PyReadonlyArray1<bool>>,
+    ) -> PyResult<f64> {
+        let default_axes: [usize; crate::core::particle::DIM] =
+            core_axes_default::<{ crate::core::particle::DIM }>();
+        let axes_vec: Vec<usize> = axes.unwrap_or_else(|| default_axes.to_vec());
+        let mask_vec: Option<Vec<bool>> = match mask {
+            Some(m) => Some(m.as_slice().map_err(py_err)?.to_vec()),
+            None => None,
+        };
+        let mask_opt = mask_vec.as_deref();
+        self.sim
+            .kl_stats(bins, range, &axes_vec, mask_opt)
+            .map_err(py_err)
+    }
+
+    /// Phase 1.5: δ‑circuit residual −α/T (windowed).
+    #[pyo3(signature = (window))]
+    fn get_alpha_over_t(&self, window: f64) -> PyResult<f64> {
+        self.sim.alpha_over_t(window).map_err(py_err)
     }
 }
 

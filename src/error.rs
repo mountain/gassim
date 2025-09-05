@@ -29,6 +29,10 @@ pub enum Error {
     #[error("not implemented: {0}")]
     NotImplemented(&'static str),
 
+    /// Diagnostic requested but insufficient samples in the current window.
+    #[error("diagnostic insufficient samples: {0}")]
+    DiagnosticInsufficientSamples(&'static str),
+
     /// Propagated I/O errors (e.g., for future data exports).
     #[error(transparent)]
     Io(#[from] std::io::Error),
