@@ -238,10 +238,7 @@ impl GasSim {
                 // Backward-compatible: piston wall only
                 let events = self.sim.pressure_events();
                 match window {
-                    Some(w) => events
-                        .into_iter()
-                        .filter(|(t, _)| *t >= now - w)
-                        .collect(),
+                    Some(w) => events.into_iter().filter(|(t, _)| *t >= now - w).collect(),
                     None => events,
                 }
             }

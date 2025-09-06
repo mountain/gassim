@@ -43,9 +43,17 @@ jobs:
         run: |
           python -m pip install -U pip
           python -m pip install -U maturin pytest numpy
-      - name: Build and install extension (develop)
+      - name: Build wheel
         run: |
-          maturin develop -m pyproject.toml
+          maturin build -m pyproject.toml
+      - name: Install wheel
+        run: |
+          python - <<'PY'
+          import glob, sys, subprocess
+          whls = sorted(glob.glob('target/wheels/gassim-*.whl'))
+          assert whls, "No built wheels found"
+          subprocess.check_call([sys.executable, '-m', 'pip', 'install', '--force-reinstall', whls[-1]])
+          PY
       - name: Run Python API tests
         run: |
           pytest -q tests_py

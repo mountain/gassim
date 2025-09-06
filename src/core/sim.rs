@@ -43,10 +43,10 @@ pub struct Simulation {
     wall_max: [WallKinematics; DIM],
 
     // Measurements (Phase 1)
-    work_total: f64,                  // cumulative mechanical work on gas
-    pressure_events: Vec<(f64, f64)>, // (time, |impulse|) on piston wall
+    work_total: f64,                           // cumulative mechanical work on gas
+    pressure_events: Vec<(f64, f64)>,          // (time, |impulse|) on piston wall
     pressure_events_all: Vec<(f64, f64, u32)>, // (time, |impulse|, wall_id) for all walls
-    piston_wall_id: Option<u32>,      // which wall is considered the piston (for pressure history)
+    piston_wall_id: Option<u32>, // which wall is considered the piston (for pressure history)
 
     // Phase 1.5: simple histories for windowed diagnostics
     energy_history: Vec<(f64, f64)>, // (time, kinetic_energy)
@@ -257,10 +257,10 @@ impl Simulation {
         self.pressure_events_all.clone()
     }
 
-    /// Phase 2: Configure a thermal wall with bath temperature T and accommodation α ∈ [0,1].
+    /// Phase 2: Configure a thermal wall with bath temperature T and accommodation α ∈ \[0,1].
     /// - wall_id in [0, 2*DIM-1]
     /// - T must be > 0 and finite
-    /// - accommodation α in [0,1]
+    /// - accommodation α in \[0,1]
     pub fn set_thermal_wall(
         &mut self,
         wall_id: u32,
