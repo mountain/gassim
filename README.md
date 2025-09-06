@@ -1,92 +1,103 @@
 # GasSim: Event-Driven Hard-Sphere Gas Simulator
 
-GasSim is a high-performance event-driven molecular dynamics (EDMD) simulator for a hard-sphere gas. The compute-intensive physics core is implemented in Rust for performance and safety, with a clean Python API (via PyO3 + maturin) for configuration, control, and analysis.
+GasSim is a high-performance event-driven molecular dynamics (EDMD) simulator for a hard-sphere gas. The compute-intensive physics core is implemented in Rust for performance and safety, with a clean Python API (via PyO3) for configuration, control, and analysis.
 
-Phase 0 delivers a validated NVE (adiabatic, static box) simulator with:
-- Analytical prediction of particle–particle (P2P) and particle–wall (P2W, static) collision times
-- Exact elastic collision resolution (hard spheres)
-- Deterministic event queue with invalidation via per-particle collision counts
-- Minimal Python API: initialize, advance in time, access positions/velocities
-- Validation tests: energy conservation and approximate isotropy
+Highlights:
+- Event-driven engine with deterministic priority queue and collision invalidation
+- Analytical prediction/resolution of particle–particle and particle–wall collisions
+- Moving walls (piston) with mechanical work and pressure impulse measurements
+- Thermal walls (heat bath) with Maxwell accommodation and First-Law-consistent heat accounting
+- Diagnostics: temperature tensor, velocity histograms, KL divergence, windowed δ‑circuit residual
+- Cross-platform Python package
 
-For roadmap details, see docs/plan.md and docs/design.md.
+For technical details, see:
+- docs/python-api.md — Python API guide with rationale and examples
+- docs/design.md — core architecture and data structures
+- docs/plan.md — roadmap snapshot and validations
 
-Phase 1 adds:
-- Moving piston (axis-aligned moving wall with piecewise-constant velocity)
-- Mechanical work accumulation on the gas
-- Pressure proxy via impulse events on the piston wall
-- Python API additions: set_piston(wall_id, velocity), get_work_done(), get_pressure_history(window=None)
+## Installation
 
-## Install and Build (Local Development)
+Install from PyPI:
+```
+pip install gassim
+```
 
 Requirements:
-- Rust toolchain (edition 2021)
-- Python >= 3.13 (CPython or PyPy)
-- maturin >= 1.9
+- Python >= 3.13
+- Platform: Linux, macOS, Windows (wheels provided where available)
 
-Steps:
-1) (Optional, on macOS) ensure a recent Xcode Command Line Tools installation.
-2) Install maturin:
-   pip install maturin
-3) Build and install the Python extension in editable mode:
-   maturin develop -m pyproject.toml
-This compiles the Rust crate and installs the `gassim` Python module into your current environment.
+If you want to build from source or develop locally, see docs/build.md.
 
-Format, lint, test (Rust):
+## Quick Start (Python)
+
 ```
+python - <<'PY'
+from gassim import GasSim
+
+# Create a 3D box with 64 particles
+sim = GasSim(
+    num_particles=64,
+    box_size=[20.0, 20.0, 20.0],
+    radius=0.3,
+    mass=1.0,
+    dim=3,           # current build supports 3D
+    seed=42,
+)
+
+# Advance to time t=1.0
+sim.advance_to(1.0)
+
+# Access state
+pos = sim.get_positions()    # shape (64, 3)
+vel = sim.get_velocities()   # shape (64, 3)
+print("positions:", pos.shape, "velocities:", vel.shape)
+
+# Configure a moving piston on the x-max wall (wall_id = 1)
+sim.advance_to(0.5)
+sim.set_piston(1, -0.05)     # slow inward motion
+sim.advance_to(2.0)
+print("work done:", sim.get_work_done())
+
+# Optional: recent piston impulse events [time, |impulse|]
+import numpy as np
+hist = np.asarray(sim.get_pressure_history(window=1.0))
+print("recent pressure events rows:", hist.shape[0])
+PY
+```
+
+## Examples
+
+- Half-box relaxation (equilibration and Maxwell speed PDF):
+  ```
+  python examples/half_box_relax.py
+  ```
+- Piston compression with macro variable collection:
+  ```
+  python examples/piston_compression_collect.py
+  ```
+- Isothermal compression (thermal wall + piston, First Law check):
+  ```
+  python examples/isothermal_compression.py
+  ```
+
+## Development
+
+Local build/testing (see docs/build.md for details):
+```
+# Rust checks
 cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo doc --no-deps
-```
 
-## Quick Start (Python)
-
-Build and install the extension locally, then run a minimal simulation:
-
-```
-pip install maturin
+# Python API tests
+python -m pip install -U maturin pytest numpy
 maturin develop -m pyproject.toml
-
-python - <<'PY'
-from gassim import GasSim
-sim = GasSim(num_particles=64, box_size=[20.0, 20.0, 20.0], radius=0.5, mass=1.0, dim=3, seed=42)
-sim.advance_to(1.0)
-print("positions:", sim.get_positions().shape, "velocities:", sim.get_velocities().shape)
-PY
+pytest -q tests_py
 ```
 
-## Example: Piston Compression (Phase 1)
+## License
 
-A simple experiment that drives a piston (the x-max wall) inward at a slow, constant speed and queries work and a pressure proxy:
+Licensed under the MIT License. See the LICENSE file for details.
 
-```
-python - <<'PY'
-from gassim import GasSim
-sim = GasSim(num_particles=128, box_size=[20.0, 20.0, 20.0], radius=0.2, mass=1.0, dim=3, seed=1)
-
-# Let system mix briefly with static walls
-sim.advance_to(0.5)
-
-# Set piston on x-max wall (axis 0, max side => wall_id = 1) to move inward
-sim.set_piston(1, -0.05)
-
-# Advance and query measurements
-sim.advance_to(10.0)
-print("work:", sim.get_work_done())
-
-# Last 5 time units of piston impulse events (pressure proxy)
-hist = sim.get_pressure_history(window=5.0)
-print("pressure events (time, |impulse|) rows:", hist.shape)
-PY
-```
-
-## Example: Half-Box Relaxation (Phase 0)
-
-An end-to-end example that initializes particles in the left half of the box with a Maxwellian velocity distribution, evolves to equilibrium, and compares the empirical speed distribution to the Maxwell prediction:
-
-```
-python examples/half_box_relax.py
-```
-
-See docs/design.md and docs/plan.md for the architecture and roadmap details.
+Copyright (c) 2025 GasSim Contributors.
