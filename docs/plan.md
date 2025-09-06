@@ -1,8 +1,6 @@
 # Project Implementation Plan
 
-This plan aims to build GasSim from a concept into a powerful research tool.
-
-The project is divided into several progressive phases, each with clear goals, key tasks, and verifiable outcomes.
+This plan tracks GasSim from concept to a robust research tool, with phased milestones, key tasks, and verifiable outcomes.
 
 ---
 
@@ -17,121 +15,158 @@ Build a physically faithful and computationally robust event-driven simulation c
 
 #### Rust Core Implementation
 - Data Structures:
-  - Define `Particle` (position, velocity, radius, mass).
-  - Define `Event` (time, event type, and a `collision_count` for invalidation).
+  - `Particle` (position, velocity, radius, mass, collision_count for invalidation).
+  - `Event` (time, event type, collision_count snapshots for invalidation).
 - Event Prediction:
-  - Implement precise analytical calculations for collision times between particles and between particles and fixed walls.
+  - Analytical collision times for particle–particle (P2P) and particle–wall (P2W) contacts (static walls).
 - Event Loop:
-  - Implement a priority queue based on `BinaryHeap`.
-  - Build the main `tick()` loop, ensuring correct event handling, time progression, and management of invalidated events.
+  - Priority queue based on `BinaryHeap` with min-time ordering via `Reverse`.
+  - Main loop that handles invalidation via collision counters, deterministic progression, and safe time advancement.
 
 #### Python Interface (PyO3)
-- Wrap the Rust `Simulation` struct into a `GasSim` Python class.
-- Provide basic interfaces:
-  - `__new__(num_particles, box_size, ...)`: Initialize the simulation environment.
-  - `advance_to(time)`: Evolve the simulation to a specific point in time.
-  - `get_positions()`, `get_velocities()`: Return the system state as NumPy arrays.
+- Wrap Rust `Simulation` in a Python `GasSim` class.
+- Core interfaces:
+  - `__new__(num_particles, box_size, radius=1.0, mass=1.0, dim=3, seed=None)`
+  - `advance_to(target_time)` (releases the GIL internally)
+  - `get_positions()`, `get_velocities()` return NumPy arrays
 
 ### Validation Criteria
-- Energy Conservation: Total kinetic energy remains constant (within floating-point error) over long simulations.
-- Distribution Check: At equilibrium, the particle velocity distribution conforms to the Maxwell–Boltzmann distribution.
-- Isotropy: At equilibrium, average kinetic energy is equal in all directions (⟨vx²⟩ ≈ ⟨vy²⟩ ≈ ⟨vz²⟩).
+- Energy Conservation: total kinetic energy constant (within FP error) over long simulations.
+- Distribution Check: approach to Maxwell–Boltzmann distribution at equilibrium (qualitative).
+- Isotropy: ⟨vx²⟩ ≈ ⟨vy²⟩ ≈ ⟨vz²⟩ after mixing.
 
 ### Current Status (2025-09-05)
-- Status: Completed.
 - Rust core implemented:
-  - Event-driven MD engine with priority queue, deterministic ordering, collision invalidation via `collision_count`.
-  - Analytical P2P and static P2W collision prediction; elastic P2P resolution; specular P2W reflection.
-  - Lazy drift to event time; numeric tolerances and bounds safety.
-  - Initialization via non-overlapping placement and random velocities; kinetic energy diagnostic.
-- Python API (PyO3 ≥ 0.26, abi3-py313) implemented:
+  - Event-driven EDMD engine with P2P/P2W prediction and collision invalidation via `collision_count`.
+  - Elastic P2P resolution; specular P2W reflection.
+  - Full drift to event time; numeric tolerances and bounds safety.
+  - Initialization: non-overlapping placement + random velocities; kinetic energy diagnostic.
+- Python API (PyO3 0.26, abi3-py313):
   - `GasSim.__new__(num_particles, box_size, radius, mass, dim, seed)`
-  - `advance_to(target_time)` (releases GIL via `Python::detach`)
-  - `get_positions()`, `get_velocities()` returning NumPy arrays (numpy crate 0.26).
+  - `advance_to(target_time)` (GIL released)
+  - `get_positions()`, `get_velocities()`
 - Validation:
-  - Energy conservation test passes (NVE).
+  - Energy conservation (NVE) passes.
   - Isotropy check passes after mixing.
-  - Unit tests for particles, events, and simulation math pass.
-- Tooling/infra:
-  - Toolchain upgraded to Python ≥ 3.13; `pyo3 = "0.26"` with `["extension-module","abi3-py313"]`; `numpy = "0.26"`.
-  - No environment variables required for build/test.
-  - CI (GitHub Actions) runs fmt, clippy (warnings as errors), tests, and docs across Ubuntu/macOS/Windows.
+- Tooling:
+  - Toolchain: Python ≥ 3.13; `pyo3 = "0.26"` with `["extension-module","abi3-py313"]`; `numpy = "0.26"`.
+  - Build guide: `docs/build.md`
 - Code references:
   - Core engine: `src/core/sim.rs`
   - Python bindings: `src/lib.rs`
-  - Integration tests: `tests/phase0.rs`
-  - Build guide: `docs/BUILD.md`
+  - Tests: `tests/phase0.rs`
+
 ---
 
 ## Phase 1: Introducing Mechanical Work — The Moving Piston
 
-### Goal
-Implement an externally driven piston with a predefined trajectory, enabling the simulator to perform work on the system.
+Status: Completed (2025-09-06)
 
-### Key Tasks
+### Goal
+Implement externally driven moving walls (piston) enabling mechanical work on the system.
+
+### Key Tasks (as implemented)
 
 #### Rust Core Upgrade
 - Dynamic Boundaries:
-  - Refactor `box_size` into a configurable list of walls.
-  - Each `Wall` object contains geometry (normal vector `n`), position, and wall velocity `u_w(t)` (initially piecewise constant).
-- Update Event Prediction:
-  - Implement collision time with a moving wall: `t_hit = (L0 - x0) / (v_x - u_w)`.
-- Update Collision Resolution:
-  - Implement the velocity update for collisions with a moving wall (moving mirror reflection).
+  - Six axis-aligned walls represented by per-wall kinematics with piecewise-constant velocity (piston model).
+- Event Prediction:
+  - P2W times computed in the moving-wall frame for both min and max faces along each axis.
+- Collision Resolution:
+  - Moving mirror reflection in the wall frame; transform back to lab frame.
 
 #### Measurement Module (Rust)
-- Impulse Accumulation:
-  - In the `tick()` loop, record the impulse Δp transferred to the piston upon each particle collision.
-- Work and Pressure Calculation:
-  - Within a specified time window Δt, compute instantaneous pressure `P_inst` and cumulative work `W` done on the gas by the piston based on accumulated impulse.
+- Impulse and Work:
+  - Record per-wall absolute normal impulse |Δp| at each P2W event.
+  - Accumulate total work `W` and `work_by_wall[wall_id]`.
+  - Maintain `(time, |impulse|)` history for the active piston wall, plus a unified `(time, |impulse|, wall_id)` history across all walls.
 
 #### Python Interface Expansion
-- Allow defining the wall’s motion trajectory during `GasSim` initialization (e.g., specify one wall as a piston with velocity `u_w`).
-- Add methods:
-  - `get_work_done()`
-  - `get_pressure_history()`
+- `set_piston(wall_id: int, velocity: float)` sets piecewise-constant piston velocity.
+- `get_work_done() -> float`
+- `get_pressure_history(window: Optional[float]=None, wall_id: Optional[int]=None) -> np.ndarray`
+- `get_mechanical_pressure(window: float, wall_id: int) -> float` (windowed estimate on the active piston wall)
 
-### First Target Experiment & Validation
-- Finite-Rate Adiabatic Compression/Expansion:
-  - Set up a piston moving at constant velocity with all walls adiabatic.
-- Validation:
-  - In the quasi-static limit (`u_w → 0`), verify that `P V^γ = const` holds (for a monatomic hard-sphere gas, `γ = 5/3`).
-  - For rapid, finite-rate compression, verify that the system’s entropy change `ΔS > 0` after the process.
+### Validation (2025-09-06)
+- `tests/phase1.rs`: moving piston smoke test (work accumulation and/or non-empty impulse history).
+- `tests/phase1_5.rs`: mechanical pressure window test (probabilistic; requires impulses in window if pressure unavailable).
+
+---
+
+## Phase 1.5: Diagnostics and δ‑Circuit (Operational Metrics)
+
+Status: Completed (2025-09-06)
+
+### Goal
+Provide operational diagnostics for equilibrium quality, anisotropy, and a windowed δ‑circuit residual −α/T.
+
+### Implemented Features
+- Temperature tensor:
+  - `get_temperature_tensor(mask=None) -> (Txx, Tyy, Tzz, T_scalar, count)` via Rust `temperature_tensor`.
+- Velocity histograms and KL diagnostics:
+  - `get_velocity_histogram(axes=None, bins=80, range=None, mask=None) -> dict`
+  - `get_kl_stats(bins=80, range=None, axes=None, mask=None) -> float` (mean D_KL over requested axes).
+- δ‑circuit residual:
+  - `get_alpha_over_t(window: float) -> float` using −(ΔU − ΔW)/(T̄ Δt) over the window (Phase 1 adiabatic approximation).
+- Work/heat summary:
+  - `get_work_heat() -> (W_total, Q_total)`
+
+### Validation (2025-09-06)
+- `tests/phase1_5.rs`: temperature tensor finiteness/positivity; histogram shape checks; KL non-negativity; α/T finiteness.
 
 ---
 
 ## Phase 2: Introducing Heat Exchange — The Thermal Wall
 
-### Goal
-Implement a thermal wall (heat bath) capable of exchanging energy with the system, enabling the simulation of isothermal and other thermodynamic processes.
+Status: Completed (2025-09-06)
 
-### Key Tasks
+### Goal
+Implement thermal walls (heat baths) to support isothermal processes, heat conduction, and First Law validation.
+
+### Key Tasks (as implemented)
 
 #### Rust Core Upgrade
-- Wall Types:
-  - Add a wall-type field (e.g., `Adiabatic`, `HeatBath`) and a temperature attribute to the `Wall` struct.
-- Thermal Reflection Logic:
-  - Implement thermal wall collisions: when a particle hits a thermal wall, outgoing velocity is resampled from a half-space Maxwellian distribution corresponding to the wall temperature `T_b` instead of mirror reflection.
-
-#### Measurement Module (Rust)
-- Heat Flow Calculation:
-  - On each thermal wall collision, compute kinetic energy change `ΔE = E_after - E_before` and accumulate into total heat flow `Q`.
+- Thermal walls:
+  - Per-wall configuration `(T_bath, accommodation α)` with dedicated RNG streams for reproducibility.
+  - Collision: with probability α, resample outgoing velocity from a half-space Maxwellian at `T_bath` in the wall frame (tangential ~ Normal(0, σ²), normal ~ Rayleigh(σ), σ² = T/m); else specular reflect.
+- Heat accounting:
+  - Event-level split: `dQ = dE − dW`; accumulate `heat_total`, `heat_by_wall[wall_id]`, and append `(time, dQ, wall_id)` to heat history.
 
 #### Python Interface Expansion
-- Allow one or more walls to be set as thermal baths with specified temperatures from Python.
-- Add a `get_heat_flow()` method.
+- `set_thermal_wall(wall_id: int, T: float, accommodation: float = 1.0) -> None`
+- `get_heat_flow() -> float` (total Q)
+- `get_heat_history(window: Optional[float]=None, wall_id: Optional[int]=None) -> np.ndarray`
+- Per-wall aggregations:
+  - `get_work_by_wall() -> np.ndarray`
+  - `get_heat_by_wall() -> np.ndarray`
+  - `get_impulse_by_wall() -> np.ndarray`
 
-### Target Experiments & Validation
-- Isothermal Compression/Expansion:
-  - Set the wall opposite the piston as a thermal bath and drive the piston to compress the gas.
-  - Validation:
-    - Record total `ΔE`, `W`, and `Q` and verify the First Law of Thermodynamics: `ΔE = W + Q`.
-    - Accumulate data for later verification of the Jarzynski equality.
-- Steady-State Heat Conduction:
-  - Set left and right walls as thermal baths with different temperatures, `T_L` and `T_R`.
-  - Validation:
-    - Once a non-equilibrium steady state is reached, measure heat flux `J_q` through the system.
-    - Using spatial binning, measure the temperature gradient `∇T` and perform preliminary verification of Fourier’s Law, `J_q ∝ -∇T`.
+### Validation (2025-09-06)
+- `tests/phase2.rs`:
+  - Thermal wall heat accumulation with First Law closure (W≈0): `|ΔU − (W+Q)|` below tolerance.
+  - Dual thermal walls produce non-empty heat histories with sane event values.
+  - Moving thermal piston: First Law closes over windows; heat events include the moving wall id.
+
+---
+
+## Project Status Snapshot (2025-09-06)
+
+- Implemented and validated:
+  - Phase 0 (NVE EDMD core, 3D).
+  - Phase 1 (moving piston/walls, work/pressure measurement).
+  - Phase 1.5 (diagnostics: temperature tensor, histograms, KL, −α/T).
+  - Phase 2 (thermal walls with accommodation, heat accounting, First Law).
+- Python API (PyO3 0.26, abi3-py313, Python ≥ 3.13) provides:
+  - Core: init, advance, get/set positions/velocities, state accessors.
+  - Work/pressure: per-wall impulse history, work totals, windowed pressure.
+  - Heat: per-wall heat totals and event histories.
+  - Diagnostics: temperature tensor, histograms, KL, δ‑circuit residual.
+- Build/Tooling:
+  - `Cargo.toml`: `pyo3 = "0.26"` with `["extension-module","abi3-py313"]`, `numpy = "0.26"`, `thiserror = "2"`, `rand = "0.9"`.
+  - `pyproject.toml`: Python ≥ 3.13; maturin backend.
+  - Build guide: `docs/build.md`.
+- Tests:
+  - `cargo test` validates Phases 0, 1, 1.5, 2.
 
 ---
 
@@ -140,17 +175,16 @@ Implement a thermal wall (heat bath) capable of exchanging energy with the syste
 Building on the foundation of the first two phases, expand to more advanced analyses and more complex physical phenomena.
 
 ### Local Field Analysis
-- Implement spatial binning (Slab Analysis) in the Rust core to measure local fields:
-  - Density `ρ(x)`
-  - Velocity `u(x)`
-  - Temperature `T(x)`
+- Spatial binning (slab/cell) in Rust to measure local fields:
+  - Density ρ(x), Velocity u(x), Temperature T(x)
 
 ### Complex Phenomena Simulation
 - Shock Waves:
-  - Drive the piston at high speeds (Mach number `M > 1`) and use local field analysis to observe shock structure.
+  - High-speed piston (Mach M > 1) and local field analysis to resolve shock structure.
 - Shear Flow:
-  - Implement Lees–Edwards or sliding wall boundary conditions to measure fluid shear viscosity `η`.
+  - Lees–Edwards or sliding wall boundary conditions to measure viscosity η.
 
-### Entropy Production Calculation
-- Utilize Python to post-process local field data returned from Rust.
-- Estimate entropy production density using continuum mechanics formulas, connecting microscopic simulation with macroscopic irreversibility.
+### Entropy Production and Contact Thermometry
+- Python post-processing for entropy production density from local fields.
+- Thermo-planes (internal transmissive Maxwell patches) for in-bulk contact thermometry (planned).
+- Controller to drive heat flux to zero to estimate contact temperature.

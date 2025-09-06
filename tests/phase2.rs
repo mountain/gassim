@@ -78,3 +78,50 @@ fn thermal_walls_heat_history_present() -> Result<()> {
 
     Ok(())
 }
+
+/// Phase 2 (moving thermal piston): With a thermal wall that is also moving (piston),
+/// event-level split uses pure heat dQ = dE - dW, so the First Law closes over any window.
+#[test]
+fn moving_thermal_piston_first_law_closure() -> Result<()> {
+    let mut sim = Simulation::new(96, [20.0, 20.0, 20.0], 0.2, 1.0, Some(20250906))?;
+
+    // Mix briefly with static adiabatic walls
+    sim.advance_to(0.5)?;
+
+    // Configure x-max wall (wall_id = 1) as thermal bath and as a slowly moving piston inward
+    sim.set_thermal_wall(1, 1.0, 1.0)?;
+    sim.set_piston_velocity(1, -0.05)?;
+
+    // Record state at start of measurement window
+    let u0 = sim.kinetic_energy();
+    let (w0, q0) = sim.work_heat();
+
+    // Advance further to accumulate both W and Q
+    sim.advance_to(4.0)?;
+
+    // Record end-of-window state
+    let u1 = sim.kinetic_energy();
+    let (w1, q1) = sim.work_heat();
+
+    let delta_u = u1 - u0;
+    let delta_w = w1 - w0;
+    let delta_q = q1 - q0;
+
+    let residual = (delta_u - (delta_w + delta_q)).abs();
+    let scale = u0.abs().max(u1.abs()).max(1.0);
+    let tol = 1e-6 * scale + 1e-9;
+
+    assert!(
+        residual <= tol,
+        "First Law residual too large with moving thermal piston: |ΔU - (ΔW+ΔQ)| = {residual}, tol = {tol}, ΔU = {delta_u}, ΔW = {delta_w}, ΔQ = {delta_q}"
+    );
+
+    // Ensure heat events include the piston wall id=1
+    let events = sim.heat_events();
+    assert!(
+        events.iter().any(|(_, _, wid)| *wid == 1),
+        "expected some heat events on the moving thermal wall (id=1)"
+    );
+
+    Ok(())
+}

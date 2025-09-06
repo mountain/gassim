@@ -72,6 +72,24 @@ This will:
 - Save periodic x–y position snapshots to `snapshots/positions_t*.png`
 - Save the final speed-vs-Maxwell PDF plot to `snapshots/speed_distribution.png`
 
+## Running Rust and Python API tests
+
+Before or after building, you can run both Rust and Python API tests locally.
+
+1) Rust unit/integration tests:
+```
+cargo test
+```
+
+2) Python extension build and API tests:
+```
+python -m pip install -U maturin pytest numpy
+maturin develop -m pyproject.toml
+pytest -q tests_py
+```
+
+These Python tests in tests_py validate the public Python API surface exposed by src/lib.rs and will fail if signatures/behavior change.
+
 ## Notes
 
 - If you update Rust code (e.g., `src/core/sim.rs`), you need to reinstall the extension so Python loads the new binary:

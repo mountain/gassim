@@ -45,6 +45,7 @@ pub struct Simulation {
     // Measurements (Phase 1)
     work_total: f64,                  // cumulative mechanical work on gas
     pressure_events: Vec<(f64, f64)>, // (time, |impulse|) on piston wall
+    pressure_events_all: Vec<(f64, f64, u32)>, // (time, |impulse|, wall_id) for all walls
     piston_wall_id: Option<u32>,      // which wall is considered the piston (for pressure history)
 
     // Phase 1.5: simple histories for windowed diagnostics
@@ -56,9 +57,13 @@ pub struct Simulation {
     thermal_walls: [Option<(f64, f64)>; N_WALLS],
     // Dedicated RNG stream per wall for reproducibility of thermal sampling
     rng_walls: Vec<StdRng>,
-    // Heat accounting
+    // Heat and per-wall accounting
     heat_total: f64,
     heat_events: Vec<(f64, f64, u32)>, // (time, dQ, wall_id)
+    // Per-wall accumulators
+    work_by_wall: [f64; N_WALLS],
+    heat_by_wall: [f64; N_WALLS],
+    impulse_by_wall: [f64; N_WALLS],
 }
 
 impl Simulation {
@@ -165,6 +170,7 @@ impl Simulation {
             wall_max,
             work_total: 0.0,
             pressure_events: Vec::new(),
+            pressure_events_all: Vec::new(),
             piston_wall_id: None,
             energy_history: Vec::new(),
             work_history: Vec::new(),
@@ -174,6 +180,9 @@ impl Simulation {
             rng_walls,
             heat_total: 0.0,
             heat_events: Vec::new(),
+            work_by_wall: [0.0; N_WALLS],
+            heat_by_wall: [0.0; N_WALLS],
+            impulse_by_wall: [0.0; N_WALLS],
         };
         // Initial snapshots at t=0
         let u0 = sim.kinetic_energy();
@@ -243,6 +252,11 @@ impl Simulation {
         self.pressure_events.clone()
     }
 
+    /// Pressure impulse events for all walls as (time, |impulse|, wall_id).
+    pub fn pressure_events_all(&self) -> Vec<(f64, f64, u32)> {
+        self.pressure_events_all.clone()
+    }
+
     /// Phase 2: Configure a thermal wall with bath temperature T and accommodation α ∈ [0,1].
     /// - wall_id in [0, 2*DIM-1]
     /// - T must be > 0 and finite
@@ -279,6 +293,21 @@ impl Simulation {
     /// Phase 2: Return a copy of heat events as (time, dQ, wall_id).
     pub fn heat_events(&self) -> Vec<(f64, f64, u32)> {
         self.heat_events.clone()
+    }
+
+    /// Per-wall total mechanical work since start.
+    pub fn work_by_wall(&self) -> Vec<f64> {
+        self.work_by_wall.to_vec()
+    }
+
+    /// Per-wall total pure heat since start.
+    pub fn heat_by_wall(&self) -> Vec<f64> {
+        self.heat_by_wall.to_vec()
+    }
+
+    /// Per-wall accumulated absolute normal impulse |Δp_n| (for pressure proxy).
+    pub fn impulse_by_wall(&self) -> Vec<f64> {
+        self.impulse_by_wall.to_vec()
     }
 
     /// Phase 1.5: Windowed mechanical pressure estimate on a wall using impulse history.
@@ -1088,6 +1117,8 @@ impl Simulation {
         // Copy pre-collision velocity for ΔQ accounting
         let v_before_vec = self.particles[i].v;
         let v_before_n = v_before_vec[axis];
+        // Pre-collision speed squared for energy accounting
+        let vsq_before: f64 = v_before_vec.iter().map(|&c| c * c).sum();
 
         let mut used_specular = false;
 
@@ -1129,13 +1160,6 @@ impl Simulation {
 
                 // Assign velocity
                 self.particles[i].v = v_after_vec;
-
-                // Heat increment ΔQ = ½ m (|v⁺|² − |v⁻|²)
-                let vsq_before: f64 = v_before_vec.iter().map(|&c| c * c).sum();
-                let vsq_after: f64 = v_after_vec.iter().map(|&c| c * c).sum();
-                let d_q = 0.5 * m * (vsq_after - vsq_before);
-                self.heat_total += d_q;
-                self.heat_events.push((self.time_now, d_q, wall_id));
             } else {
                 // Specular branch (moving mirror)
                 used_specular = true;
@@ -1159,18 +1183,37 @@ impl Simulation {
             self.particles[i].r[axis] = pos_now + self.particles[i].radius;
         }
 
-        // Measurements: impulse and mechanical work (applies to piston and thermal)
+        // Measurements: impulse, mechanical work, and pure heat split
         let m = self.particles[i].mass;
         let v_after_n = self.particles[i].v[axis];
         let delta_p = m * (v_after_n - v_before_n); // signed impulse on particle along normal
+
+        // Per-wall impulse accumulation (pressure proxy)
+        self.impulse_by_wall[wall_id as usize] += delta_p.abs();
 
         if let Some(piston_id) = self.piston_wall_id {
             if piston_id == wall_id {
                 self.pressure_events.push((self.time_now, delta_p.abs()));
             }
         }
-        // Mechanical work done on gas by the moving wall: W += u_w * Δp
-        self.work_total += u_w * delta_p;
+        // Record impulse event for all walls
+        self.pressure_events_all
+            .push((self.time_now, delta_p.abs(), wall_id));
+
+        // Energy/work/heat accounting
+        let vsq_after: f64 = self.particles[i].v.iter().map(|&c| c * c).sum();
+        let d_e = 0.5 * m * (vsq_after - vsq_before);
+        let d_w = u_w * delta_p; // mechanical work (wall -> gas)
+        self.work_total += d_w;
+        self.work_by_wall[wall_id as usize] += d_w;
+
+        if self.thermal_walls[wall_id as usize].is_some() {
+            let d_q = d_e - d_w; // pure heat
+            self.heat_total += d_q;
+            self.heat_by_wall[wall_id as usize] += d_q;
+            self.heat_events.push((self.time_now, d_q, wall_id));
+            debug_assert!((d_e - (d_w + d_q)).abs() <= 1e-12);
+        }
 
         Ok(())
     }

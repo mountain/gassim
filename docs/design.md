@@ -1,599 +1,414 @@
 # GasSim Design Document
 
-This document specifies the architecture, core data structures, event-driven algorithms, performance and robustness strategies, Python bindings and packaging, testing and validation plan, and phased extensions for GasSim. It serves as the authoritative technical blueprint for building the simulator.
+This document specifies the architecture, core data structures, event-driven algorithms, performance and robustness strategies, Python bindings and packaging, testing and validation plan, and phased extensions for GasSim. It serves as the authoritative technical blueprint for building and evolving the simulator.
 
 This document aligns with:
 - Roadmap and milestones in docs/plan.md
 - Engineering standards in AGENT.md
-- Current scaffolding in Cargo.toml, src/lib.rs, and pyproject.toml
+- Current implementation in Cargo.toml, src/lib.rs, and pyproject.toml
 
-Note: The current Rust module exposes a minimal PyO3 function for scaffolding only. The design below describes the planned core engine and Python API for Phases 0–2.
+Note: The current Rust module implements Phases 0, 1, 1.5, and 2, exposing a full `GasSim` class via PyO3 with a validated EDMD core, moving piston, diagnostics, and thermal walls.
 
 ## 1. Goals and Scope
 
 - Primary goals
-  - Implement a physically faithful and computationally robust Event-Driven Molecular Dynamics (EDMD) simulator for a hard-sphere gas (NVE in Phase 0).
+  - Implement a physically faithful and computationally robust Event-Driven Molecular Dynamics (EDMD) simulator for a hard-sphere gas (Phase 0: NVE).
   - Keep compute-intensive physics in Rust for performance and memory safety; provide a clean Python API (via PyO3) for configuration, control, and analysis.
   - Extend to a moving piston (mechanical work) and thermal walls (heat exchange) to reproduce canonical non-equilibrium thermodynamic processes and support statistical physics validations.
 
 - Non-goals (current)
   - GPU or distributed execution.
   - Complex intermolecular potentials (focus on hard-sphere collisions).
-  - Arbitrary complex geometries (start with axis-aligned boxes).
+  - Arbitrary complex geometries (use axis-aligned boxes).
   - Built-in visualization front-end (handled from Python, e.g., Matplotlib).
 
 - Quality and maintainability
-  - Follow AGENT.md: rustfmt, clippy (warns as errors), unit and integration tests, complete Rust doc comments, and custom error handling without unwrap/expect in application logic.
+  - Follow AGENT.md: rustfmt, clippy (warns as errors), unit and integration tests, complete Rust doc comments, and custom error handling (no unwrap/expect in app logic).
   - Modular, testable design; descriptive naming; single-responsibility functions.
 
 ## 2. High-Level Architecture
 
 - Rust core (compute engine)
-  - Event prediction: particle–particle (P2P), particle–wall (P2W) for static walls, moving piston walls, and thermal walls.
-  - Event queue: priority queue over event time (min-heap behavior).
-  - Main event loop: deterministic time advancement and event resolution.
+  - Event prediction: particle–particle (P2P), particle–wall (P2W) for static and moving walls; thermal walls with Maxwell accommodation.
+  - Event queue: priority queue over event time (BinaryHeap with min-time ordering via Reverse).
+  - Main event loop: deterministic time advancement, event invalidation via collision counters, and robust resolution.
   - Collision resolution and state updates (elastic hard-sphere).
-  - Measurements: kinetic energy, momentum impulse (pressure proxy), mechanical work, and heat.
+  - Measurements: kinetic energy, momentum impulse (pressure proxy), mechanical work, heat; simple histories.
 
 - Python bindings (control and analysis)
   - Expose class `GasSim` to Python with initialization, advancement to target time, state access as NumPy arrays, and accessors for observables and histories.
-  - Use PyO3 and maturin for packaging and distribution.
+  - Use PyO3 and maturin for packaging and distribution; release the GIL during long compute.
 
 - Build and packaging
-  - Cargo.toml: `crate-type = ["cdylib"]`, `pyo3 = "0.25"`.
-  - pyproject.toml: maturin backend, `pyo3/extension-module` feature, Python ≥ 3.11, CPython/PyPy classifiers.
+  - Cargo.toml:
+    - `crate-type = ["cdylib","rlib"]`
+    - `pyo3 = "0.26"` with features `["extension-module","abi3-py313"]`
+    - `numpy = "0.26"`, `thiserror = "2"`, `rand = "0.9"`, `ordered-float = "5"`
+  - pyproject.toml:
+    - maturin backend, Python `>=3.13`, classifiers for CPython and PyPy, dynamic version.
+    - `[tool.maturin] features = ["pyo3/extension-module"]`
 
 ### Thermal contact and local thermometry (ADD)
 
-- Core engine supports two thermal boundary primitives:
+- Core engine supports a thermal wall primitive (implemented) and a future ThermoPlane primitive (planned):
   1) Thermal Wall (Maxwell accommodation at a box face; piston may simultaneously be moving and thermal).
   2) ThermoPlane (an infinitesimally thin internal plane for in‑bulk contact thermometry; transmissive Maxwell “patch” with probability α).
 
 - Observability plane/channel for heat events dQ parallels the work/impulse channel; enables contact‑temperature readout via zero‑heat‑flux condition and closes the δ‑circuit with dU = δQ − p dV. The contact 1‑form dU + p dV − T dS maps to AEG’s α = da − μ du − λ a dv under the dictionary (S,V;U,T,p) = (v, −u; a, λ a, μ), guaranteeing structural consistency.
 
-## 3. Recommended Project Layout
+## 3. Project Layout
 
 - src/
   - lib.rs (PyO3 module entry; binds Rust API to Python)
   - core/
-    - particle.rs
-    - wall.rs
-    - event.rs
-    - sim.rs (Simulation state and event loop)
-    - pq.rs (priority queue wrapper)
-    - measure.rs (measurements/observables)
-    - math.rs (geometry and numerics helpers)
+    - particle.rs (Particle type and DIM)
+    - event.rs (Event, EventKind, deterministic ordering)
+    - sim.rs (Simulation state, event loop, physics, measurements)
+    - mod.rs (module wiring)
   - error.rs (custom error enum via thiserror)
-  - ffi/ (Rust↔Python bridges and zero-copy array exports)
 - tests/ (Rust integration tests)
+  - phase0.rs, phase1.rs, phase1_5.rs, phase2.rs
 - docs/
   - design.md (this document)
   - plan.md (roadmap and phases)
+  - build.md, publish.md, supplement.md
 
-Future crates (planned):
-- thiserror (custom error types)
-- numpy (zero-copy NumPy array exports)
-- rand (initialization and thermal wall sampling)
-- parry (broad-phase acceleration; planned)
-- criterion (benchmarks; optional)
-- log/env_logger (logging)
+Planned modules (future):
+- measure.rs (structured measurements/observables)
+- math.rs (geometry/numerics helpers)
+- pq.rs (explicit min-heap wrapper)
+- wall.rs (generalized boundary definitions)
 
 ## 4. Physical Model and Assumptions
 
 - Hard-sphere gas with elastic collisions (no potential energy).
-- Particle attributes: position r, velocity v, radius a, mass m (initially uniform a and m).
-- Dimensions: initial implementation targets 2D; design remains 3D-ready (D ∈ {2,3}).
+- Particle attributes: position r, velocity v, radius a, mass m (uniform a and m in current implementation).
+- Dimensions: current implementation is fixed 3D (DIM = 3).
 - Boundaries by phase:
   - Phase 0: static axis-aligned box with adiabatic walls.
-  - Phase 1: introduce a moving piston (wall with prescribed velocity).
-  - Phase 2: introduce thermal walls (heat bath behavior).
-- Units: allow dimensionless or SI-consistent units; configuration records time/length/mass scales.
+  - Phase 1: moving piston walls with piecewise‑constant normal velocity.
+  - Phase 2: thermal walls (heat bath behavior with Maxwell accommodation).
+- Units: allow dimensionless or SI-consistent units; configuration records time/length/mass scales in metadata (implicit in parameters).
 
 ## 5. Core Data Structures
 
 - Particle
   - id: u32
-  - r: VecD (f64[D])
-  - v: VecD (f64[D])
+  - r: [f64; 3]
+  - v: [f64; 3]
   - radius: f64
   - mass: f64
   - collision_count: u64 (incremented after each realized event; used to invalidate stale events)
 
-- Wall
-  - id: u32
-  - kind: enum WallKind { Adiabatic, Moving { u: VecD }, HeatBath { T: f64 } }
-  - n: VecD (unit outward normal)
-  - pos: f64 (plane position along normal; e.g., x = pos)
-
 - Event
-  - time: f64
+  - time: f64 (NotNan)
   - kind: enum EventKind { P2P { i: u32, j: u32 }, P2W { i: u32, wall_id: u32 } }
   - cc_i: u64, cc_j: Option<u64> (collision_count snapshots for invalidation)
-  - Priority: sorted by time ascending; use `std::cmp::Reverse` or a custom Ord wrapper over BinaryHeap.
+  - Deterministic ordering: by time, then kind (P2P < P2W), then cc tie-breaker.
 
 - Simulation
   - time_now: f64
+  - box_size: [f64; 3] (edge lengths)
   - particles: Vec<Particle>
-  - walls: Vec<Wall>
-  - pq: BinaryHeap<Reverse<Event>> (or a dedicated min-heap type)
-  - meas: Measurements (accumulators and histories)
-  - params: SimParams (dimension, tolerances, RNG seed, etc.)
-  - last_update_time per particle (for lazy drift; optional)
-
-- Measurements
-  - work_total: f64
-  - heat_total: f64
-  - impulse_accum_piston: f64 (for pressure estimate)
-  - histories: optional ring buffers/time series (windowed or down-sampled)
-  - derived on-demand: kinetic energy, temperature proxy, etc.
-
-### Additional/extended types (ADD)
-
-- Thermal boundary kinds:
-
-```rust
-enum ThermalBcKind {
-    // Classical wall (boundary of domain)
-    Wall { T: f64, accommodation: f64 },             // accommodation ∈ [0,1], 1=Maxwell, 0=specular
-    // Internal transmissive patch for contact thermometry
-    Plane { T: f64, accommodation: f64, normal: VecD, point: VecD, area: f64 },
-}
-```
-
-- Boundary container:
-
-```rust
-struct Boundary {
-    id: u32,
-    kind: ThermalBcKind,
-    // geometry: plane x·n = pos for faces; for Plane, (normal, point, finite area or infinite flag)
-    n: VecD,
-    pos: f64,      // for axis-aligned faces
-}
-```
-
-- EventKind addition (covers both thermal Wall and Plane):
-
-```rust
-// ADD to existing EventKind:
-P2Thermal { i: u32, bnd_id: u32 }
-```
-
-- Measurements extensions:
-
-```rust
-struct HeatEvent { t: f64, dQ: f64, bnd_id: u32 }
-struct PressureEvent { t: f64, impulse_abs: f64, wall_id: u32 }
-struct WindowCfg { dt_window: f64, max_len: usize }
-struct Moments { /* D known at compile time in Rust module scope */
-    sum_c: VecD,
-    // temperature tensor accumulators
-    // in 2D this would be 2x2, in 3D 3x3; represent as flat array or small fixed matrix
-    // shown here conceptually:
-    // sum_cc[j][k] = Σ c_j c_k over samples
-}
-```
-
-Accumulators:
-- heat_total: f64; heat_history: RingBuffer<HeatEvent>
-- work_total: f64; pressure_history: RingBuffer<PressureEvent>
-- optional sliding-window velocity moments for anisotropy metrics and KL diagnostics (see §10).
+  - pq: BinaryHeap<Reverse<Event>>
+  - Moving walls (Phase 1):
+    - wall_min[3], wall_max[3]: kinematics (base_pos, base_time, u)
+  - Measurements:
+    - work_total: f64; work_by_wall[6]
+    - pressure_events: Vec<(t, |Δp|)> (active piston)
+    - pressure_events_all: Vec<(t, |Δp|, wall_id)>
+    - impulse_by_wall[6]
+    - energy_history: Vec<(t, U)>
+    - work_history: Vec<(t, W)>
+  - Thermal (Phase 2):
+    - thermal_walls[6]: Option<(T_bath, accommodation α)>
+    - rng_walls: per-wall RNG streams for reproducibility
+    - heat_total: f64; heat_by_wall[6]; heat_events: Vec<(t, dQ, wall_id)>
 
 ## 6. Event Prediction and Resolution
 
 ### 6.1 Particle–Particle (P2P) collision time
 
-Given i, j:
-- Relative displacement d = r_j − r_i
-- Relative velocity u = v_j − v_i
-- Contact at |d + u t| = R = a_i + a_j
-- Quadratic: a t^2 + b t + c = 0
-  - a = u·u
-  - b = 2 d·u
-  - c = d·d − R^2
+- Relative displacement d = r_j − r_i; relative velocity u = v_j − v_i.
+- Contact at |d + u t| = R = a_i + a_j.
+- Quadratic a t² + b t + c = 0 with:
+  - a = u·u, b = 2 d·u, c = d·d − R².
 - Conditions:
-  - If a ≈ 0 (|u|≈0): no relative motion → no collision.
-  - Discriminant Δ = b^2 − 4ac; if Δ < 0: no real root → no collision.
-  - Candidate root t = (-b - sqrt(Δ)) / (2a); require t > ε and b < 0 (approaching).
+  - a ≈ 0: no relative motion → no collision.
+  - Discriminant Δ < 0: no collision.
+  - Candidate earlier root t = (−b − √Δ) / (2a); require b < 0 (approaching) and t > ε.
 
 Resolution (elastic):
-- At contact, unit normal n = (r_j - r_i) / |r_j - r_i|
-- Standard elastic update (conserves momentum and kinetic energy):
-  - Let u_n = (v_j - v_i)·n
-  - With masses (m_i, m_j), update the normal components accordingly (center-of-mass frame reflection).
-  - A convenient form:
-    - v_i' = v_i + (2 m_j / (m_i + m_j)) u_n n
-    - v_j' = v_j - (2 m_i / (m_i + m_j)) u_n n
-  - Only the normal components change; tangential components are preserved.
+- Unit normal n = (r_j − r_i)/|r_j − r_i|.
+- Normal relative speed u_n = (v_j − v_i)·n.
+- Update normal components only (conserve momentum and kinetic energy):
+  - v_i' = v_i + (2 m_j / (m_i + m_j)) u_n n
+  - v_j' = v_j − (2 m_i / (m_i + m_j)) u_n n
 
-### 6.2 Particle–Wall (P2W) collision time — static wall
+### 6.2 Particle–Wall (P2W) collision time — static or moving wall (piston)
 
-- Signed distance to plane s0 = n·r - pos
-- Normal velocity component u_n = n·v
-- Contact condition: s0 + u_n t = ± radius (choose sign for the nearer face)
-- Require that u_n points toward the wall and t > ε; otherwise no collision.
-
-Resolution (mirror reflection):
-- v' = v - 2 (v·n) n
-
-### 6.3 Particle–Wall (P2W) collision time — moving wall (piston)
-
-- Wall velocity u_w (only normal component matters physically)
-- In wall frame: u_n_rel = (v - u_w)·n
-- Contact: s0 + u_n_rel t = ± radius → t = (±radius - s0) / u_n_rel, valid if u_n_rel < 0 and t > ε
+- Walls indexed: wall_id = 2*k (min), 2*k+1 (max) along axis k in {0,1,2}.
+- Moving-wall frame:
+  - Min wall: (x − pos_min_now) + (v_x − u_min) t = radius (require v_x − u_min < 0)
+  - Max wall: (pos_max_now − x) + (u_max − v_x) t = radius (require u_max − v_x < 0)
+- Choose smallest positive t > ε.
 
 Resolution:
-- Reflect in wall frame, then transform back:
-  - v_rel' = v_rel - 2 (v_rel·n) n, where v_rel = v - u_w
-  - v' = v_rel' + u_w
+- Specular reflection in moving wall frame; transform back:
+  - v'_n = 2 u_w − v_n (normal component), tangential unchanged.
+- Thermal branch (Phase 2): see §6.4.
 
-### 6.4 Thermal wall (heat bath)
+### 6.3 Thermal wall (heat bath, Phase 2)
 
-- On collision with a thermal wall at temperature T_b:
-  - Resample outgoing velocity from a half-space Maxwellian distribution corresponding to T_b (only velocities pointing into the domain).
-  - Normal component sampled from the flux-weighted distribution; tangential components from Maxwellian at T_b.
-- Accumulate heat: ΔE = E_after - E_before.
+- On collision with a thermal wall at temperature T_b with accommodation α:
+  - With probability α, resample outgoing velocity in wall frame from half-space Maxwellian:
+    - Tangential components ~ Normal(0, σ²) with σ² = T_b/m
+    - Normal (into gas): Rayleigh(σ) with sign into the domain
+  - Otherwise, specular reflect in wall frame.
+  - Transform back to lab frame by adding wall velocity.
+- Heat accounting: dE from speed change; dW = u_w Δp; pure heat dQ = dE − dW.
+- Accumulate totals and event histories.
 
-#### 6.4.1 Detailed spec — Maxwell accommodation (ADD)
+### 6.4 Event invalidation
 
-- Collision rule (accommodation α): with probability α, resample in the wall frame; with probability 1−α, do specular reflection.
-  - Let wall normal n (into gas), wall velocity U (piston allowed). Pre‑collision: c⁻ = v⁻ − U.
-  - Resampling at bath temperature T_b (m = mass, k_B = 1 in code units):
-    - Tangential components: c⁺_{t} ~ Normal(0, σ²), with σ² = T_b / m (1 tangential component in 2D; 2 in 3D).
-    - Normal (into gas): c⁺_n ~ Rayleigh(σ) (flux‑weighted half‑space Maxwell).
-  - Transform back: v⁺ = c⁺ + U.
-- Heat accounting: ΔQ = (m/2)(|v⁺|² − |v⁻|²) (positive when wall → gas). Push (t, ΔQ, bnd_id) into heat_history; accumulate heat_total.
-- Notes: The Rayleigh sampler can use inverse‑transform r = σ sqrt(−2 ln(1−u)).
-
-### 6.5 Event invalidation
-
-- Each particle maintains `collision_count` (cc) incremented after any realized event it participates in.
+- Each particle maintains `collision_count`; incremented after realized events.
 - Events store cc snapshots at scheduling time.
-- On pop: if a participant’s current cc ≠ stored cc, the event is invalid; discard it.
-
-### 6.6 ThermoPlane (internal contact thermometer) (ADD)
-
-- Geometric predicate: free‑flight line–plane intersection (like P2W), but the plane is transmissive.
-- On crossing, with probability α perform transmissive Maxwellization (same sampler as thermal wall but keep the sign of the normal so the particle continues across the plane); otherwise pass through unchanged.
-- Log each modified crossing as a heat event with the same ΔQ definition.
-- This enables in‑bulk contact thermometry by tuning T_b so that the window‑averaged ĖQ → 0 on that plane; see Python control loop in §11.
+- On pop: if a participant’s current cc ≠ stored cc, discard (stale).
 
 ## 7. Event Loop and Time Advancement
 
 Initialization:
-- For each particle, predict the earliest P2P contacts (Phase 0 may do all pairs) and P2W contacts, and push the soonest ones into the queue.
+- Rejection-sample non-overlapping initial positions; random velocities in [-1, 1].
+- Schedule initial P2P (all pairs, naive) and earliest P2W events.
 
 Advancement (`advance_to(target_time)`):
 - While `time_now < target_time`:
-  - Pop event e with the minimal time.
-  - If `e.time > target_time`: drift all particles to `target_time` (or lazily drift involved particles), set `time_now = target_time`, break.
-  - Validate cc snapshots; if invalid → discard and continue.
-  - Drift the involved entities to `e.time` (lazy drift: only particles touched by e).
-  - Resolve the collision (update velocities; apply measurements).
-  - Increment collision_count for involved particles.
-  - Reschedule events for involved particles against relevant candidates and walls; push the new earliest events.
-
-Drift strategies:
-- Lazy/on-demand: store `last_update_time` per particle; update only touched particles to the current time to reduce global work.
-- Full drift (optional, for clarity at small N): update all particle positions each event.
+  - Pop earliest event; if its time > target_time, drift to target and stop (reinsert event).
+  - Validate cc snapshots; discard if invalid.
+  - Drift all particles to event time (full drift strategy).
+  - Resolve event:
+    - P2P: update velocities elastically.
+    - P2W: moving mirror or thermal resampling; record impulse/work/heat.
+  - Record snapshot: append (t, U) and (t, W).
+  - Increment collision_count of involved particles.
+  - Reschedule for involved particle(s).
 
 Determinism:
-- Provide tie-break rules when event times are equal within tolerance (e.g., prefer P2P over P2W, then by id ordering) to ensure reproducible trajectories.
-
-Pseudocode (simplified):
-```
-loop:
-  e = pq.pop_min()
-  if e.time > T: drift_all_to(T); break
-  if !valid(e): continue
-  drift_involved_to(e.time)
-  resolve(e)
-  bump_collision_counts(e.involved)
-  measure.on_event(e)
-  reschedule_for(e.involved)
-```
-
-### Measurement hooks (ADD)
-
-- After every resolved event:
-  - If P2W on a piston wall: accumulate impulse and mechanical work.
-  - If P2Thermal: accumulate ΔQ.
-  - Update sliding‑window velocity moments for anisotropy/KL if enabled (O(1) amortized per event with Welford‑style updates).
-- Provide a low‑overhead window compactor (down‑sample) to keep histories bounded.
+- Priority ordering: by time, then EventKind (P2P < P2W), then cc tie-break.
+- EPS_TIME = 1e-12 for time/geometric checks and positivity thresholds.
 
 ## 8. Numerical Robustness and Determinism
 
-- Tolerances: use combined absolute/relative ε (e.g., 1e-12) for time and geometric checks to avoid duplicate events at t ≈ 0 and grazing contacts.
-- Normalization: guard against near-zero-length normals (e.g., if |d| is tiny).
-- Stable math: factor common terms, avoid catastrophic cancellation where possible; centralize sensitive operations in math.rs.
-- Priority ordering: stable tie-breaking by event kind and ids for determinism.
-- Bounds checking: ensure positions remain inside the domain after drift (with tolerance) and adjust if necessary.
-
-### Thermal randomness & reproducibility (ADD)
-
-- Thermal sampling uses a dedicated RNG stream per boundary id; seeds recorded in metadata for replay.
-- Tie‑break precedence: P2P > P2W > P2Thermal on equal time within ε, then by (i, j, wall_id/bnd_id) index for determinism.
+- Tolerances: combined absolute ε (1e-12) to avoid duplicate/grazing pathologies.
+- Normalization: guard against degenerate P2P contact normals.
+- Stable math: centralize sensitive operations; avoid catastrophic cancellation.
+- Bounds checking: after drift, clamp positions inside the dynamic domain with tolerance.
+- Randomness/reproducibility:
+  - Explicit seed in `Simulation::new(..., seed)`.
+  - Per-wall RNG streams for thermal sampling; deterministic tie-breaking in the queue.
 
 ## 9. Performance Design
 
 - Complexity:
-  - Naive all-pairs prediction is O(N^2 log N) with a priority queue; acceptable for functional validation at small/medium N in Phase 0.
-  - Introduce acceleration later:
-    - Cell lists / uniform grids to reduce candidate pairs.
-    - Broad-phase via Parry (planned) for generalization.
-
+  - Naive all-pairs P2P scheduling (O(N² log N) with PQ). Acceptable for functional validation at small/medium N.
+- Planned acceleration:
+  - Cell lists / uniform grids to prune P2P candidates.
+  - Broad-phase via Parry in the future.
 - Data layout:
-  - Start with AoS (Vec<Particle>). For large N, consider migrating hot paths to SoA to improve cache locality.
-
+  - AoS (Vec<Particle>) currently; consider SoA for hotspots if scaling up.
 - Parallelism:
-  - EDMD is mostly sequential due to causality in the event loop.
-  - Parallelize measurements/aggregation where possible; consider batched diagnostics.
-
+  - EDMD loop is inherently sequential; parallelize diagnostics/aggregation as feasible.
 - Python GIL:
-  - Release GIL during long-running `advance_to` using `Python::allow_threads` to avoid blocking Python.
-
-### Selective diagnostics (ADD)
-
-- Temperature‑tensor and KL diagnostics are opt‑in and can be computed on a spatial mask (bulk vs near‑wall), or on a coarse slab grid to cap cost.
-- For large N, export periodic moments instead of full velocities; Python builds tensors and histograms.
+  - Long-running `advance_to` releases GIL via `Python::detach` (PyO3 0.26).
 
 ## 10. Measurements and Observables
 
-- Kinetic energy: E_k = Σ ½ m |v|^2 (no potential energy for hard spheres).
-- Pressure and work (Phase 1):
-  - On piston collisions, accumulate normal momentum change Δp.
-  - Estimate instantaneous pressure P_inst ≈ Δp / (A Δt) where A is piston area (length in 2D).
-  - Mechanical work W accumulates via force·displacement or via impulse with piston kinematics.
+- Kinetic energy: E_k = Σ ½ m |v|².
+- Pressure/work (Phase 1):
+  - On piston wall contacts, record |Δp|; accumulate per-wall impulse.
+  - Mechanical work: dW = u_w Δp; accumulate `work_total` and `work_by_wall[wall_id]`.
+  - Histories:
+    - `pressure_events`: (t, |Δp|) for active piston wall.
+    - `pressure_events_all`: (t, |Δp|, wall_id) for all walls.
+  - Windowed pressure estimate: P ≈ (Σ |Δp|)/(A Δt) over a window for the active piston wall.
 - Heat (Phase 2):
-  - On thermal wall collisions, ΔE contributes to the cumulative heat Q.
-- Histories:
-  - Maintain windowed/down-sampled time series for pressure, work, heat as requested by the API.
-
-### 10.1 Temperature definitions (operational) (ADD)
-
-- Drift‑removed kinetic temperature (scalar):
-  - u = ⟨v⟩, c_i = v_i − u, T = (m / (D N)) Σ_i ||c_i||².
-- Temperature tensor:
-  - T_{jk} = (m / N) Σ_i c_{i,j} c_{i,k}, and T = (1/D) tr(T).
-- Anisotropy indicators:
-  - η_∞ = max_j |T_{jj}/T − 1|, and η_F = ||T − T I||_F / (T √D).
-
-### 10.2 Pressure and work (clarification) (ADD)
-
-- Mechanical pressure at piston: use work–volume slope p_mech = −ΔW / ΔV or windowed impulse/area/time (already present).
-- For EOS checks, compare bulk p_th ≈ (1/D) tr(P) ≈ n k_B T vs wall‑normal measure; differences quantify near‑wall anisotropy.
-
-### 10.3 Heat and contact temperature (ADD)
-
-- Heat flux per boundary:
-  - ĖQ_b ≈ Σ_{k in window} ΔQ_k / Δt.
-- Contact thermometry (operational): a Python controller adjusts boundary T_b until ĖQ_b → 0 → returns contact temperature T_contact for that site/plane.
-
-### 10.4 Distribution diagnostics (KL/KS) (ADD)
-
-- 1D (per component) KL: histogram P of c_x vs Q = Normal(0, σ²) with σ² = T/m:
-  - D_KL(P‖Q) = Σ_j p_j ln(p_j / q_j).
-- 3D speed version: compare radial histogram to Maxwell speed PDF.
-- Report time series of KL (bulk and near‑wall).
-
-### 10.5 δ‑Circuit measurement (non‑equilibrium entropy accounting) (ADD)
-
-- Baseline (ideal monatomic gas, k_B = 1):
-  - dS_IG = (1/T) dU + (p_th/T) dV, and ΔS_IG = N [ (3/2) ln(T₂/T₁) + ln(V₂/V₁) ].
-- δ‑circuit 1‑form:
-  - α_IG = dU − (−p_mech dV + T dS_IG).
-  - The vertical residual −α_IG / T is the running entropy‑production measure; integrate over time/windows.
-- AEG consistency: under the contactomorphism (S,V;U,T,p) = (v, −u; a, λ a, μ), α_TD = dU + p dV − T dS pulls back to α = da − μ du − λ a dv, so the δ‑circuit is geometrically faithful.
+  - Pure heat dQ = dE − dW at thermal events; `heat_total`, `heat_by_wall[wall_id]`, `heat_events`.
+- Diagnostics (Phase 1.5):
+  - Temperature tensor (drift-removed) → (Txx, Tyy, Tzz, T_scalar).
+  - Velocity histograms and KL divergence vs Gaussian model (per-axis, centered).
+  - δ‑circuit residual −α/T (windowed): −(ΔU − ΔW)/(T̄ Δt) for adiabatic windows.
 
 ## 11. Python API (PyO3)
 
 Module name: `gassim`. Expose a `GasSim` class.
 
-Phase 0 (minimal):
-- Initialization:
-  - `GasSim(num_particles: int, box_size: Sequence[float], radius: float = 1.0, mass: float = 1.0, dim: int = 2, seed: int | None = None, ...)`
-  - Optional initial velocity distribution (uniform/normal) and target temperature; may be staged in later minor releases.
-- Advancement:
-  - `advance_to(target_time: float) -> None` (releases GIL internally).
-- State access:
-  - `get_positions() -> np.ndarray[float64]  # shape (N, D)`
-  - `get_velocities() -> np.ndarray[float64] # shape (N, D)`
+Initialization:
+- `GasSim(num_particles: int, box_size: Sequence[float], radius: float = 1.0, mass: float = 1.0, dim: int = 3, seed: int | None = None)`
+  - Current build supports `dim=3` only; box_size length must equal 3.
 
-Phase 1 additions:
-- Moving wall configuration at init or via method:
-  - `set_piston(wall_id: int, velocity: float | Sequence[float]) -> None` (initially piecewise-constant velocity).
-- Observables:
-  - `get_work_done() -> float`
-  - `get_pressure_history(window: float | None = None) -> np.ndarray`
+Advancement:
+- `advance_to(target_time: float) -> None` (releases GIL during compute).
 
-Phase 2 additions:
-- Thermal walls:
-  - `set_thermal_wall(wall_id: int, T: float) -> None`
-- Observables:
-  - `get_heat_flow() -> float`
+State access:
+- `get_positions() -> np.ndarray[float64]  # shape (N, 3)`
+- `get_velocities() -> np.ndarray[float64] # shape (N, 3)`
+- `set_positions(positions: np.ndarray) -> None` (rebuilds event queue)
+- `set_velocities(velocities: np.ndarray) -> None` (rebuilds event queue)
+
+Phase 1 (moving piston):
+- `set_piston(wall_id: int, velocity: float) -> None`
+- `get_work_done() -> float`
+- `get_pressure_history(window: float | None = None, wall_id: int | None = None) -> np.ndarray  # shape (M,2)`
+- `get_mechanical_pressure(window: float, wall_id: int) -> float`
+
+Phase 1.5 (diagnostics & δ‑circuit):
+- `get_temperature_tensor(mask: Optional[np.ndarray]) -> (Txx, Tyy, Tzz, T_scalar, count)`
+- `get_velocity_histogram(axes: Optional[List[int]] = None, bins: int = 80, range: Optional[Tuple[float,float]] = None, mask: Optional[np.ndarray] = None) -> Dict[int, Dict[str, np.ndarray]]`
+- `get_kl_stats(bins: int = 80, range: Optional[Tuple[float,float]] = None, axes: Optional[List[int]] = None, mask: Optional[np.ndarray] = None) -> float`
+- `get_alpha_over_t(window: float) -> float`
+- `get_work_heat() -> Tuple[float, float]`
+
+Phase 2 (thermal walls):
+- `set_thermal_wall(wall_id: int, T: float, accommodation: float = 1.0) -> None`
+- `get_heat_flow() -> float`
+- `get_heat_history(window: Optional[float] = None, wall_id: Optional[int] = None) -> np.ndarray  # shape (M,3)`
+- `get_work_by_wall() -> np.ndarray[float64] # shape (6,)`
+- `get_heat_by_wall() -> np.ndarray[float64] # shape (6,)`
+- `get_impulse_by_wall() -> np.ndarray[float64] # shape (6,)`
 
 Implementation notes:
-- Zero-copy arrays via `numpy` crate to expose internal buffers where safe; else copy.
-- Error mapping: Rust `Error` → `PyErr` with clear messages for invalid parameters, out-of-bounds, or state errors.
+- Zero-copy arrays via `numpy` crate where applicable; otherwise copy on export.
+- Error mapping: Rust `Error` → `PyErr` with clear messages for invalid parameters or state errors.
 
-### Phase 1.5 diagnostics (ADD)
+### Thermal contact / thermometry (Phase 2+) (ADD)
 
-- `get_temperature_tensor(mask: Optional[np.ndarray]) -> (Txx, Tyy, Tzz, T_scalar, count)`
-- `get_velocity_histogram(axes=("x","y","z"), bins=80, range=None, mask=None) -> dict`
-- `get_kl_stats(mask=None) -> float` (returns current window KL for chosen mode)
-
-### Thermal contact / thermometry (Phase 2) (ADD)
-
-- `set_thermal_wall(wall_id: int, T: float, accommodation: float = 1.0) -> None`
-- `set_thermo_plane(plane_id: int, point: Sequence[float], normal: Sequence[float], T: float, accommodation: float = 0.02, area: Optional[float] = None) -> None`
-- `get_heat_history(boundary_id: int, window: float) -> np.ndarray  # [t, dQ]`
-- Controller pattern (Python‑side): `find_contact_temperature(boundary_id, tol=..., max_iter=...)` adjusts T to drive ⟨ĖQ⟩ → 0.
+- Planned:
+  - `set_thermo_plane(plane_id: int, point: Sequence[float], normal: Sequence[float], T: float, accommodation: float = 0.02, area: Optional[float] = None) -> None`
+  - `get_heat_history(boundary_id: int, window: float) -> np.ndarray  # [t, dQ]`
+  - Controller: `find_contact_temperature(boundary_id, tol, max_iter)` drives ⟨ĖQ⟩ → 0.
 
 ### δ‑circuit helpers (ADD)
 
-- `get_mechanical_pressure(window: float, wall_id: int) -> float`
+- `get_mechanical_pressure(window: float, wall_id: int) -> float` (extended to arbitrary walls)
 - `get_entropy_IG(time_series: bool = False) -> (S_vals or ΔS)`
 - `get_alpha_over_T(window: float) -> float  # windowed −α/T`
 - `get_work_heat() -> (W_total, Q_total)`
 
-Implementation notes: all data are windowed; masks allow bulk vs near‑wall selection.
-
 ## 12. Error Handling and Logging
 
 - Errors:
-  - Define a comprehensive `Error` enum using `thiserror` (e.g., InvalidParam, MathError, NoCollision, OutOfBounds, NotImplemented).
+  - `thiserror`-based `Error` enum (e.g., InvalidParam, MathError, NoCollision, OutOfBounds, NotImplemented, DiagnosticInsufficientSamples).
   - All fallible functions return `Result<T, Error>`; no unwrap/expect in application logic.
 
 - Logging:
-  - Integrate `log` facade with optional `env_logger` for debug builds.
-  - Consider Python-side toggles to control verbosity.
+  - Integrate `log` facade with optional `env_logger` for debug builds (planned toggles from Python).
 
 - Documentation:
-  - All public items have Rust doc comments (///) covering purpose, parameters, returns, and error variants, enabling complete `cargo doc`.
-
-### Diagnostics guardrails (ADD)
-
-- KL/anisotropy modules validate binning and sample counts; return a dedicated DiagnosticInsufficientSamples error if below threshold.
+  - Public items have Rust doc comments; `cargo doc` builds API docs.
 
 ## 13. Testing and Validation
 
-Rust unit tests (in-module #[cfg(test)]):
-- event.rs: P2P/P2W collision time edge cases (no collision, grazing, equal speed, t≈0); resolution conserves momentum and kinetic energy.
-- sim.rs: event invalidation, ordering determinism under tie/tolerance, and long-run stability of totals (e.g., no particle escapes due to drift error).
+Rust unit tests:
+- event.rs: deterministic ordering and cc validation.
+- particle.rs: invariants and kinetic energy.
 
-Rust integration tests (in tests/):
-- Small simulations advancing to a given time; assert:
-  - Energy conservation within tolerance over long NVE runs (Phase 0).
-  - Velocity distribution approaches Maxwell–Boltzmann at equilibrium (statistical checks on histogram/mean/variance).
-  - Isotropy at equilibrium: <v_x^2> ≈ <v_y^2> (and ≈ <v_z^2> in 3D).
+Rust integration tests (tests/):
+- Phase 0: energy conservation (long NVE runs), isotropy after mixing.
+- Phase 1: moving piston smoke test; impulse/work sanity.
+- Phase 1.5: temperature tensor, histograms, KL diagnostic, windowed α/T.
+- Phase 2: First Law closure ΔU = W + Q; dual thermal walls heat histories; moving thermal piston closure over windows.
 
-Python-level tests (optional, via maturin develop):
-- Import `gassim`, construct `GasSim`, run `advance_to`, inspect arrays and basic invariants.
-- Phase 1: compression/expansion with piston; check quasi-static PV^γ constancy (γ = 5/3 for monatomic hard spheres) as piston speed → 0; for finite rates, entropy change ΔS > 0 qualitatively.
-- Phase 2: validate First Law ΔE = W + Q; steady-state conduction with T_L ≠ T_R shows heat flux J_q and negative temperature gradient with preliminary Fourier behavior.
-
-CI gates:
+CI gates (recommended):
 - `cargo fmt --check`
 - `cargo clippy -- -D warnings`
 - `cargo test`
 - `cargo doc --no-deps`
 
-### Additional unit/integration tests (ADD)
-
-1) Thermal sampler tests: moments of sampled c⁺ match Maxwell half‑space within statistical error; Rayleigh law for c_n.
-2) First Law closure (Phase 2): ΔU = Σ_b Q_b + W over runs (tolerance relative to U).
-3) Contact temperature: single thermal wall at T_b relaxes to T_b; thermo‑plane controller recovers T_contact with |T_contact − T_kin| bulk median ≤ 5%.
-4) δ‑circuit “must‑pass” (Phase 1/2):
-   - Same‑end‑volume compression ensemble: all runs share V_end.
-   - Quasi‑static limit: ⟨−α/T⟩ increases monotonically with |piston speed|, → 0 as speed → 0.
-   - Work–energy residual small (|ΔU − W| in Phase 1 adiabatic; |ΔU − W − Q| in Phase 2).
-   - Baseline correlation: deviations in T and wall pressure vs adiabatic/EOS baselines positively correlate with ⟨−α/T⟩.
-
-### Diagnostic thresholds (defaults) (ADD)
-
-- Bulk anisotropy: η_F < 0.1 typical; warn if exceeded persistently.
-- KL (bulk): D_KL < 1e−2 typical for near‑equilibrium; warn on sustained spikes.
+Additional tests (ADD):
+- Thermal sampler moments vs theory (half-space Maxwell, Rayleigh for normal).
+- Contact temperature recovery via thermo-plane controller.
+- δ‑circuit “must‑pass” ensemble checks across piston speeds and end volumes.
 
 ## 14. Reproducibility and Randomness
 
 - Seed management:
-  - Initialization accepts an explicit RNG seed; record it in simulation metadata for reproducibility.
-  - Thermal wall resampling uses the same RNG stream (thread-safe as needed).
+  - Initialization accepts an explicit RNG seed; record in metadata (parameters) for reproducibility.
+  - Thermal wall resampling uses per-wall RNG streams; deterministic within a given configuration.
 
 - Metadata:
-  - Expose `get_metadata()` returning version, build info, parameters, dimension, and seed.
-
-### Per‑boundary RNG seeds and controllers (ADD)
-
-- Record per‑boundary RNG seeds and controller states (e.g., find_contact_temperature iterations) in metadata for exact reruns.
+  - Expose via Python-side helpers (planned) version, build info, parameters, dimension, and seed.
 
 ## 15. Versioning and Packaging
 
 - Semantic versioning:
-  - 0.x may include breaking changes; Python API stability is preferred where feasible.
+  - 0.x may include breaking changes; attempt to keep Python API stable where feasible.
 - Packaging:
-  - Built and published via maturin. Python ≥ 3.11; CPython and PyPy supported.
-- Module/package name: `gassim`.
+  - Built and published via maturin.
+  - Python ≥ 3.13 (abi3-py313); CPython and PyPy supported per classifiers.
 
 ## 16. Milestones and Alignment with docs/plan.md
 
-- Phase 0 (Foundational EDMD, NVE):
-  - Implement P2P and static P2W predictions/resolutions, event loop, and measurements for energy.
-  - Validate energy conservation, Maxwell–Boltzmann distribution, isotropy.
-  - Expose minimal Python API (init, advance_to, get_positions/velocities).
+- Phase 0 (Foundational EDMD, NVE): Completed and validated.
+- Phase 1 (Mechanical work — moving piston): Completed; impulse/work histories; pressure estimate.
+- Phase 1.5 (Diagnostics & δ‑circuit): Completed; temperature tensor, histograms/KL, α/T.
+- Phase 2 (Heat exchange — thermal wall): Completed; First Law closure and histories.
 
-- Phase 1 (Mechanical work — moving piston):
-  - Moving wall kinematics integrated into predictions/resolutions.
-  - Impulse accumulation for pressure; compute work; pressure history.
-  - Validation: quasi-static PV^γ constancy; ΔS > 0 for finite-rate processes.
-
-- Phase 2 (Heat exchange — thermal wall):
-  - Thermal wall resampling and heat accumulation.
-  - Validation: First Law ΔE = W + Q; steady-state conduction; preliminary Fourier’s law.
-
-### Phase 1.5 (Diagnostics & δ‑circuit) (ADD)
-
-- Deliver anisotropy/KL diagnostics, δ‑circuit accounting, and “must‑pass” CI gate.
-- Scripts: `examples/phase1_adiabatic_alpha.py`, `examples/diagnostics_qc.py`.
-
-### Phase 2 details (Thermal contact & thermometry) (ADD)
-
-- Implement Thermal Wall and ThermoPlane; expose heat histories; First‑Law regression.
-- Example: piston compression with one thermal wall; conduction test between T_L ≠ T_R.
+Planned:
+- Local field analysis (slab/cell binning) and complex flows (shock, shear).
+- Thermo-planes and contact thermometry; extended δ‑circuit helpers.
 
 ## 17. Risks and Mitigations
 
 - Numerical pathologies (grazing collisions, t≈0):
-  - Unified tolerances; tie-breaking; guard against repeated immediate events; normalize with care.
+  - Tolerances, tie-breaking, guard against repeated immediate events; normalized contact normals.
 - Event storms and stale queues:
-  - Periodic partial or full rescheduling; maintain counters and heuristics to rebuild.
+  - Partial/full rescheduling heuristics (planned); current collision-count invalidation.
 - API evolution:
-  - Track changes in this design doc; provide migration notes when altering Python/Rust APIs.
+  - Track changes in this design doc; provide migration notes for Python/Rust APIs.
 - Performance at scale:
-  - Plan for cell lists and broad-phase acceleration (Parry); evolve towards SoA if necessary.
+  - Introduce cell lists/broad-phase; consider SoA layouts.
 
 ## 18. Future Enhancements
 
 - Local field analysis:
-  - Spatial binning (slabs/cells) for density ρ(x), velocity u(x), temperature T(x).
+  - Spatial binning for ρ(r), u(r), T(r); export compact diagnostics and histories.
 - Complex phenomena:
-  - Shock waves from high-speed piston; shear flows via sliding walls or Lees–Edwards BCs.
+  - Shock waves via high-speed piston; shear flows via sliding walls or Lees–Edwards BCs.
 - Parallelism:
-  - Parallel measurement aggregation; multi-instance ensembles for statistics.
+  - Parallel measurement aggregation; multi-instance ensembles.
 - Visualization and tooling:
-  - Convenience exporters to NumPy/Parquet/NetCDF; example notebooks for analyses.
+  - Exporters to NumPy/Parquet/NetCDF; example notebooks.
 
 ### Additional local fields and geometry (ADD)
 
-- Slab/cell binning to export ρ(r), u(r), T(r) and contact‑temperature field from sparse thermo‑planes (kriging/IDW blend with kinetic‑temperature map).
+- Binning and contact‑temperature field estimation (kriging/IDW over sparse thermo‑planes).
 - Variable accommodation, moving thermo‑planes (Lagrangian probes), and specular/roughness models.
 
 ## 19. Appendix: Notation
 
-- r, v: position and velocity vectors (ℝ^D)
+- r, v: position and velocity vectors (ℝ³)
 - a, m: particle radius and mass
 - n: wall outward unit normal
-- pos: wall plane position along n (e.g., x = pos)
 - R: sum of radii at contact, R = a_i + a_j
 - ε: numerical tolerance (absolute/relative)
 - Δp, W, Q: impulse, work, and heat accumulators
 
 ## 20. Appendix: Maxwell sampling cookbook (ADD)
 
-- Tangential components: Box–Muller or Ziggurat for Normal(0, σ²).
-- Positive normal (flux‑weighted): sample R ~ Rayleigh(σ), set c⁺_n = R.
+- Tangential components: Box–Muller for Normal(0, σ²).
+- Positive normal (flux‑weighted): sample R ~ Rayleigh(σ), set c⁺_n = ±R into the domain.
 - Specular mixing: with probability 1−α, reflect c⁺_n = −c⁻_n, keep tangentials.
 - Heat increment: ΔQ = (m/2)(||v⁺||² − ||v⁻||²).
-- Contact controller (pseudo‑code):
+- Controller (Python‑side):
 
 ```python
 # every Δt window
 qdot = sum(dQ) / Δt
 if abs(qdot) < tol:
     done
-T_b -= kappa * qdot  # simple integral control; or bracket root by bisection
+T_b -= kappa * qdot  # integral control; or bracket root by bisection
 ```
 
-### Notes on Theory Alignment (for the Methods section of the paper)
+### Notes on Theory Alignment
 
-- The simulator’s δ‑circuit is the numerical instantiation of the contact 1‑form α_TD = dU + p dV − T dS; under the AEG dictionary (S,V;U,T,p) = (v, −u; a, λ a, μ), it pulls back to α = da − μ du − λ a dv. The horizontal part δa = μ du + λ a dv records reversible bookkeeping; the vertical residual α gives the non‑commutative “area/entropy‑production” measure −α/T. This justifies using macroscopic U, V, T, p to assess irreversibility, independent of microstate enumerations.
+- The simulator’s δ‑circuit is the numerical instantiation of the contact 1‑form α_TD = dU + p dV − T dS; under the AEG dictionary (S,V;U,T,p) = (v, −u; a, λ a, μ), it pulls back to α = da − μ du − λ a dv. The horizontal part δa = μ du + λ a dv records reversible bookkeeping; the vertical residual α gives the non‑commutative “area/entropy‑production” measure −α/T, enabling macroscopic irreversibility assessment independent of microstate enumeration.

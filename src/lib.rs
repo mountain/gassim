@@ -1,5 +1,5 @@
 use numpy::ndarray::Array2;
-use numpy::{IntoPyArray, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
+use numpy::{IntoPyArray, PyArray1, PyArray2, PyReadonlyArray1, PyReadonlyArray2};
 use pyo3::exceptions::PyValueError;
 use pyo3::prelude::*;
 use pyo3::types::PyDict;
@@ -200,26 +200,51 @@ impl GasSim {
         Ok(self.sim.work_total())
     }
 
-    /// Phase 1: Return a (M, 2) NumPy array of [time, |impulse|] events recorded on the piston wall.
+    /// Phase 1/2: Return pressure impulse events as rows [time, |impulse|].
     ///
     /// Parameters
     /// - window: if provided, only events with time >= (current_time - window) are returned.
-    #[pyo3(signature = (window=None))]
+    /// - wall_id: if provided, filter events for this wall only; otherwise return piston-wall events for backward compatibility.
+    #[pyo3(signature = (window=None, wall_id=None))]
     fn get_pressure_history<'py>(
         &self,
         py: Python<'py>,
         window: Option<f64>,
+        wall_id: Option<u32>,
     ) -> PyResult<Py<PyArray2<f64>>> {
-        let events = self.sim.pressure_events();
-        let now = self.sim.time();
-        let filtered: Vec<(f64, f64)> = match window {
-            Some(w) => {
-                if !w.is_finite() || w < 0.0 {
-                    return Err(py_err("window must be a non-negative finite float"));
-                }
-                events.into_iter().filter(|(t, _)| *t >= now - w).collect()
+        if let Some(w) = window {
+            if !w.is_finite() || w < 0.0 {
+                return Err(py_err("window must be a non-negative finite float"));
             }
-            None => events,
+        }
+        let now = self.sim.time();
+        let filtered: Vec<(f64, f64)> = match wall_id {
+            Some(wid) => {
+                // Use per-wall events
+                self.sim
+                    .pressure_events_all()
+                    .into_iter()
+                    .filter(|(t, _imp, wid_ev)| {
+                        let pass_time = match window {
+                            Some(w) => *t >= now - w,
+                            None => true,
+                        };
+                        pass_time && *wid_ev == wid
+                    })
+                    .map(|(t, imp, _)| (t, imp))
+                    .collect()
+            }
+            None => {
+                // Backward-compatible: piston wall only
+                let events = self.sim.pressure_events();
+                match window {
+                    Some(w) => events
+                        .into_iter()
+                        .filter(|(t, _)| *t >= now - w)
+                        .collect(),
+                    None => events,
+                }
+            }
         };
         let m = filtered.len();
         let mut arr = Array2::<f64>::zeros((m, 2));
@@ -248,12 +273,12 @@ impl GasSim {
         Ok(self.sim.work_heat())
     }
 
-    /// Phase 2: Return the total accumulated heat Q transferred from thermal boundaries to the gas.
+    /// Phase 2: Return the total accumulated heat Q transferred from thermal boundaries to the gas (pure heat).
     fn get_heat_flow(&self) -> PyResult<f64> {
         Ok(self.sim.heat_total())
     }
 
-    /// Phase 2: Return a (M, 3) NumPy array of [time, dQ, wall_id] heat events.
+    /// Phase 2: Return a (M, 3) NumPy array of [time, dQ, wall_id] heat events (pure heat).
     ///
     /// Parameters
     /// - window: if provided, only events with time >= (current_time - window) are returned.
@@ -294,6 +319,24 @@ impl GasSim {
             arr[[i, 2]] = wid as f64;
         }
         Ok(arr.into_pyarray(py).to_owned().into())
+    }
+
+    /// Per-wall total mechanical work since start. Returns shape (2*DIM,).
+    fn get_work_by_wall<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray1<f64>>> {
+        let v = self.sim.work_by_wall();
+        Ok(v.into_pyarray(py).to_owned().into())
+    }
+
+    /// Per-wall total pure heat since start. Returns shape (2*DIM,).
+    fn get_heat_by_wall<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray1<f64>>> {
+        let v = self.sim.heat_by_wall();
+        Ok(v.into_pyarray(py).to_owned().into())
+    }
+
+    /// Per-wall accumulated absolute impulse |Δp_n| (pressure proxy). Returns shape (2*DIM,).
+    fn get_impulse_by_wall<'py>(&self, py: Python<'py>) -> PyResult<Py<PyArray1<f64>>> {
+        let v = self.sim.impulse_by_wall();
+        Ok(v.into_pyarray(py).to_owned().into())
     }
 
     /// Phase 1.5: Temperature tensor diagnostics with optional boolean mask.

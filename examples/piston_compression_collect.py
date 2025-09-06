@@ -119,8 +119,12 @@ def main(cfg: Config) -> None:
         # Measurements
         W = sim.get_work_done()
         # Pressure proxy using impulses in last window (Δt)
-        impulses = sim.get_pressure_history(window=(t_next - t))
-        P = pressure_proxy_from_impulses(impulses, piston_area, (t_next - t))
+        try:
+            P = sim.get_mechanical_pressure(window=(t_next - t), wall_id=cfg.piston_wall_id)
+            events = sim.get_pressure_history(window=(t_next - t))
+        except Exception:
+            events = sim.get_pressure_history(window=(t_next - t))
+            P = pressure_proxy_from_impulses(events, piston_area, (t_next - t))
 
         # Temperature proxy from velocities (k_B=1)
         v = sim.get_velocities()
@@ -132,7 +136,7 @@ def main(cfg: Config) -> None:
         presses.append(P)
 
         print(
-            f"t={t_next:8.3f}  W={W:14.6e}  P_est={P:12.6e}  T_proxy={T:10.6f}  events={impulses.shape[0]}"
+            f"t={t_next:8.3f}  W={W:14.6e}  P_est={P:12.6e}  T_proxy={T:10.6f}  events={events.shape[0]}"
         )
 
         t = t_next

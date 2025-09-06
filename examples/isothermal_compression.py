@@ -23,7 +23,7 @@ from gassim import GasSim
 
 def kinetic_energy(vel: np.ndarray, mass: float) -> float:
     # vel shape (N, 3), mass scalar
-    vsq = (vel * vel).sum(axis=1).sum()
+    vsq = float(np.sum(vel * vel))
     return 0.5 * mass * vsq
 
 

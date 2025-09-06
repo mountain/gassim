@@ -26,6 +26,11 @@ cargo fmt --all --check
 cargo clippy --all-targets -- -D warnings
 cargo test
 cargo doc --no-deps
+
+# Python API tests (requires Python >= 3.13)
+python3 -m pip install -U maturin pytest numpy
+maturin develop -m pyproject.toml
+pytest -q tests_py
 ```
 
 All must pass before proceeding.
